@@ -67,10 +67,13 @@ async function initDB() {
       stripe_customer_id VARCHAR(255),
       payout_method_id VARCHAR(255),
       payout_last4 VARCHAR(4),
+      moov_account_id VARCHAR(255),
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  // Add moov_account_id column if it doesn't exist (for existing tables)
+  await pool.query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS moov_account_id VARCHAR(255)`).catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
@@ -356,9 +359,91 @@ app.post('/wallet/save-card', async (req, res) => {
 });
 
 // ── WALLET: Withdraw ───────────────────────────────────────
+const MOOV_PUBLIC_KEY = process.env.MOOV_PUBLIC_KEY;
+const MOOV_SECRET_KEY = process.env.MOOV_SECRET_KEY;
+const MOOV_ACCOUNT_ID = process.env.MOOV_ACCOUNT_ID;
+
+// Moov API helper
+async function moovRequest(method, path, body) {
+  const credentials = Buffer.from(`${MOOV_PUBLIC_KEY}:${MOOV_SECRET_KEY}`).toString('base64');
+  const res = await fetch(`https://api.moov.io${path}`, {
+    method,
+    headers: {
+      'Authorization': `Basic ${credentials}`,
+      'Content-Type': 'application/json',
+      'X-Wait-For': 'rail-response'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  try { return { status: res.status, data: JSON.parse(text) }; }
+  catch { return { status: res.status, data: text }; }
+}
+
+// Create or get Moov account for organizer
+async function getOrCreateMoovAccount(email, displayName) {
+  // Check if we already have a Moov account ID stored
+  const result = await pool.query('SELECT moov_account_id FROM wallets WHERE email = $1', [email]);
+  if (result.rows.length && result.rows[0].moov_account_id) {
+    return result.rows[0].moov_account_id;
+  }
+  // Create new Moov account
+  const nameParts = (displayName || email.split('@')[0]).split(' ');
+  const response = await moovRequest('POST', '/accounts', {
+    accountType: 'individual',
+    profile: {
+      individual: {
+        name: {
+          firstName: nameParts[0] || 'User',
+          lastName: nameParts[1] || 'Pitch-In'
+        },
+        email
+      }
+    },
+    capabilities: ['send-funds', 'collect-funds'],
+    foreignID: email
+  });
+  if (response.status === 200 || response.status === 201) {
+    const moovAccountId = response.data.accountID;
+    await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
+    return moovAccountId;
+  }
+  throw new Error('Could not create Moov account: ' + JSON.stringify(response.data));
+}
+
+// Get Moov link token for user to add payment method
+app.post('/moov/link-token', async (req, res) => {
+  try {
+    const { email, displayName } = req.body;
+    const moovAccountId = await getOrCreateMoovAccount(email, displayName);
+    // Create a link token for the frontend to use Moov Drop-in UI
+    const response = await moovRequest('POST', `/accounts/${MOOV_ACCOUNT_ID}/transfers`, null);
+    res.json({ success: true, moovAccountId });
+  } catch (err) {
+    console.error('Moov link token error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Get Moov payment methods for account
+app.get('/moov/payment-methods/:email', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT moov_account_id FROM wallets WHERE email = $1', [req.params.email]);
+    if (!result.rows.length || !result.rows[0].moov_account_id) {
+      return res.json({ paymentMethods: [] });
+    }
+    const moovAccountId = result.rows[0].moov_account_id;
+    const response = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
+    res.json({ paymentMethods: response.data || [] });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.post('/wallet/withdraw', async (req, res) => {
   try {
-    const { email, amount, method } = req.body; // method: 'standard' or 'instant'
+    const { email, amount, method } = req.body;
     if (!email || !amount) return res.status(400).json({ error: 'Email and amount required' });
 
     const walletResult = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
@@ -372,25 +457,76 @@ app.post('/wallet/withdraw', async (req, res) => {
     const amountCents = Math.round(parseFloat(amount) * 100);
     const instantFee = method === 'instant' ? Math.round(amountCents * INSTANT_FEE) : 0;
     const payoutCents = amountCents - instantFee;
+    const payoutAmount = payoutCents / 100;
 
-    // Create Stripe payout
-    const payoutParams = {
-      amount: payoutCents,
-      currency: 'usd',
-      method: method === 'instant' ? 'instant' : 'standard',
-      metadata: { email, walletWithdrawal: 'true' }
-    };
+    let payoutId, arrivalDate, actualMethod;
 
-    const payout = await stripe.payouts.create(payoutParams).catch(async (err) => {
-      if (method === 'instant') {
-        return stripe.payouts.create({ ...payoutParams, method: 'standard' });
+    if (method === 'instant') {
+      // Use Moov for instant payout
+      try {
+        const moovAccountId = await getOrCreateMoovAccount(email, wallet.display_name);
+
+        // Get payment methods for this account
+        const pmResponse = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
+        const paymentMethods = pmResponse.data || [];
+        const rtpMethod = paymentMethods.find(pm => pm.paymentMethodType === 'rtp-credit' || pm.paymentMethodType === 'ach-credit-same-day' || pm.paymentMethodType === 'push-to-card');
+
+        if (!rtpMethod) {
+          return res.status(400).json({
+            error: 'no_payment_method',
+            message: 'No instant payout method on file. Please add a debit card first.',
+            moovAccountId,
+            needsSetup: true
+          });
+        }
+
+        // Get Pitch-In's Moov payment method to send from
+        const platformPMResponse = await moovRequest('GET', `/accounts/${MOOV_ACCOUNT_ID}/payment-methods`);
+        const platformPMs = platformPMResponse.data || [];
+        const platformPM = platformPMs.find(pm => pm.paymentMethodType === 'moov-wallet');
+
+        if (!platformPM) throw new Error('Platform wallet not configured in Moov');
+
+        // Create transfer
+        const transfer = await moovRequest('POST', '/transfers', {
+          source: {
+            accountID: MOOV_ACCOUNT_ID,
+            paymentMethodID: platformPM.paymentMethodID
+          },
+          destination: {
+            accountID: moovAccountId,
+            paymentMethodID: rtpMethod.paymentMethodID
+          },
+          amount: { currency: 'USD', value: payoutCents },
+          description: `Pitch-In wallet withdrawal for ${email}`
+        });
+
+        if (transfer.status !== 200 && transfer.status !== 201) {
+          throw new Error('Transfer failed: ' + JSON.stringify(transfer.data));
+        }
+
+        payoutId = transfer.data.transferID;
+        actualMethod = 'instant';
+        arrivalDate = 'Within 30 minutes';
+      } catch (moovErr) {
+        console.error('Moov instant payout failed:', moovErr.message);
+        // Don't fall back silently — tell the user
+        return res.status(400).json({ error: moovErr.message });
       }
-      throw err;
-    });
-
-    const arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', {
-      weekday: 'long', month: 'long', day: 'numeric'
-    });
+    } else {
+      // Standard withdrawal via Stripe
+      const payout = await stripe.payouts.create({
+        amount: payoutCents,
+        currency: 'usd',
+        method: 'standard',
+        metadata: { email, walletWithdrawal: 'true' }
+      });
+      payoutId = payout.id;
+      actualMethod = 'standard';
+      arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', {
+        weekday: 'long', month: 'long', day: 'numeric'
+      });
+    }
 
     // Deduct from wallet
     await pool.query(
@@ -401,18 +537,17 @@ app.post('/wallet/withdraw', async (req, res) => {
     // Record transaction
     await pool.query(
       'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [email, 'withdrawal', amount, instantFee / 100, `${method === 'instant' ? 'Instant' : 'Standard'} withdrawal`, payout.id]
+      [email, 'withdrawal', amount, instantFee / 100, `${actualMethod === 'instant' ? 'Instant' : 'Standard'} withdrawal`, payoutId]
     );
 
-    // Send email
     const displayName = wallet.display_name || email.split('@')[0];
-    emailWithdrawal(email, displayName, (payoutCents/100).toFixed(2), method === 'instant' ? 'Instant (30 min)' : 'Standard (next business day)', arrivalDate).catch(() => {});
+    emailWithdrawal(email, displayName, payoutAmount.toFixed(2), actualMethod === 'instant' ? 'Instant (30 min)' : 'Standard (next business day)', arrivalDate).catch(() => {});
 
     res.json({
       success: true,
-      amount: payoutCents / 100,
+      amount: payoutAmount,
       fee: instantFee / 100,
-      method: payout.method,
+      method: actualMethod,
       arrivalDate,
       newBalance: parseFloat(wallet.balance) - parseFloat(amount)
     });
