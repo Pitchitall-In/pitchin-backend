@@ -269,19 +269,40 @@ app.get('/og/:slug', async (req, res) => {
     const pot = result.rows[0].data;
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const pct = Math.min(100, Math.round(raised / pot.goal * 100));
+    const remaining = Math.max(0, pot.goal - raised).toFixed(2);
     const link = `https://pitchinapp.netlify.app/app.html?pot=${req.params.slug}`;
-    res.send(`<!DOCTYPE html><html><head>
-      <meta charset="UTF-8"/>
-      <meta property="og:title" content="${pot.name} — Pitch In!"/>
-      <meta property="og:description" content="$${raised.toFixed(0)} of $${pot.goal} raised · ${pct}% funded · Tap to pitch in"/>
-      <meta property="og:url" content="${link}"/>
-      <meta property="og:type" content="website"/>
-      <meta property="og:image" content="https://pitchin-backend-cjat.onrender.com/og-image/${req.params.slug}"/>
-      <meta property="og:image:width" content="1200"/>
-      <meta property="og:image:height" content="630"/>
-      <meta name="twitter:card" content="summary_large_image"/>
-      <meta http-equiv="refresh" content="0;url=${link}"/>
-    </head><body><a href="${link}">View pot</a></body></html>`);
+    const title = `${pot.name} — Pitch In! 💰`;
+    const desc = `$${raised.toFixed(0)} raised of $${pot.goal} goal · ${pct}% funded · $${remaining} to go · Tap to pitch in with your group`;
+    // Use static OG image hosted on Netlify — iMessage needs a real PNG/JPEG
+    const imageUrl = `https://pitchinapp.netlify.app/og-preview.png`;
+    res.setHeader('Cache-Control', 'no-cache, no-store');
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8"/>
+  <title>${title}</title>
+  <meta name="description" content="${desc}"/>
+  <meta property="og:title" content="${title}"/>
+  <meta property="og:description" content="${desc}"/>
+  <meta property="og:url" content="${link}"/>
+  <meta property="og:type" content="website"/>
+  <meta property="og:image" content="${imageUrl}"/>
+  <meta property="og:image:width" content="1200"/>
+  <meta property="og:image:height" content="630"/>
+  <meta property="og:image:type" content="image/png"/>
+  <meta property="og:site_name" content="Pitch-In"/>
+  <meta name="twitter:card" content="summary_large_image"/>
+  <meta name="twitter:title" content="${title}"/>
+  <meta name="twitter:description" content="${desc}"/>
+  <meta name="twitter:image" content="${imageUrl}"/>
+  <meta http-equiv="refresh" content="0;url=${link}"/>
+</head>
+<body>
+  <h1>${title}</h1>
+  <p>${desc}</p>
+  <a href="${link}">Tap to Pitch In →</a>
+</body>
+</html>`);
   } catch (err) { res.status(500).send('Error'); }
 });
 
