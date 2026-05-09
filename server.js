@@ -727,6 +727,22 @@ app.post('/refund-expired-pot', async (req, res) => {
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
+// Get payment intent details (used after Cash App Pay redirect)
+app.get('/get-payment-intent/:id', async (req, res) => {
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(req.params.id);
+    res.json({
+      amount: paymentIntent.amount,
+      status: paymentIntent.status,
+      potId: paymentIntent.metadata.potId,
+      potName: paymentIntent.metadata.potName
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('Pitch-In backend running'));
 
 const PORT = process.env.PORT || 3000;
