@@ -2,10 +2,12 @@ const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cors = require('cors');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const app = express();
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const PLATFORM_FEE = 0.02; // 2%
+const PLATFORM_FEE = 0.02;
+const INSTANT_FEE = 0.015;
 
 app.use(cors({
   origin: ['https://pitchinapp.netlify.app', 'http://localhost:3000'],
@@ -19,6 +21,23 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Simple password hashing using built-in crypto (no bcrypt needed)
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+  return salt + ':' + hash;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(':');
+  const verify = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+  return hash === verify;
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pots (
@@ -28,11 +47,41 @@ async function initDB() {
     )
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS organizers (
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      username VARCHAR(255) NOT NULL,
+      password_hash VARCHAR(512) NOT NULL,
+      token VARCHAR(64),
+      token_expires TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallets (
       email VARCHAR(255) PRIMARY KEY,
+      display_name VARCHAR(255),
+      balance DECIMAL(10,2) DEFAULT 0,
+      total_earned DECIMAL(10,2) DEFAULT 0,
+      total_contributed DECIMAL(10,2) DEFAULT 0,
       stripe_customer_id VARCHAR(255),
       payout_method_id VARCHAR(255),
       payout_last4 VARCHAR(4),
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      amount DECIMAL(10,2) NOT NULL,
+      fee DECIMAL(10,2) DEFAULT 0,
+      description TEXT,
+      pot_slug VARCHAR(8),
+      pot_name VARCHAR(255),
+      stripe_id VARCHAR(255),
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
@@ -44,88 +93,172 @@ initDB().catch(console.error);
 async function sendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY || !to) return;
   try {
-    await fetch('https://api.resend.com/emails', {
+    const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${RESEND_API_KEY}`
-      },
-      body: JSON.stringify({
-        from: 'Pitch-In <noreply@pitchinapp.netlify.app>',
-        to,
-        subject,
-        html
-      })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${RESEND_API_KEY}` },
+      body: JSON.stringify({ from: 'Pitch-In <noreply@pitchin.llc>', to, subject, html })
     });
-  } catch (err) {
-    console.warn('Email error:', err.message);
-  }
+    const data = await response.json();
+    if (data.error) console.warn('Email error:', data.error);
+  } catch (err) { console.warn('Email error:', err.message); }
+}
+
+function emailWelcome(email, name) {
+  return sendEmail({
+    to: email, subject: 'Welcome to Pitch-In 🎉',
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#2352e8">Welcome to Pitch-In, ${name}! 💰</h2>
+      <p>Your wallet is ready. Every time a pot you organize fills up, your earnings land here instantly.</p>
+      <p style="color:#666">Withdraw anytime — free standard transfer or instant to your debit card for 1.5%.</p>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
+  });
 }
 
 function emailContributionConfirmed(email, name, amount, potName, potLink) {
   return sendEmail({
-    to: email,
-    subject: `✓ You're in! $${amount} added to ${potName}`,
-    html: `
-      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-        <h2 style="color:#2352e8">You're in! 💸</h2>
-        <p>Hey ${name}, your <strong>$${amount}</strong> has been added to <strong>${potName}</strong>.</p>
-        <p style="color:#666">Your money is held securely by Stripe. If the pot doesn't fill before the deadline, you'll be automatically refunded in full.</p>
-        <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
-        <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
-      </div>
-    `
+    to: email, subject: `✓ You're in! $${amount} added to ${potName}`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#2352e8">You're in! 💸</h2>
+      <p>Hey ${name}, your <strong>$${amount}</strong> has been added to <strong>${potName}</strong>.</p>
+      <p style="color:#666">Held securely by Stripe. Auto-refunded in full if the goal isn't met.</p>
+      <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
   });
 }
 
 function emailPotFilled(organizerEmail, potName, amount, potLink) {
   return sendEmail({
-    to: organizerEmail,
-    subject: `🎉 Your pot is full! $${amount} on the way`,
-    html: `
-      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-        <h2 style="color:#0a8a4a">Your pot is full! 🎉</h2>
-        <p><strong>${potName}</strong> has reached its goal of <strong>$${amount}</strong>.</p>
-        <p style="color:#666">Your payout has been initiated and should arrive within 30 minutes to your debit card on file.</p>
-        <a href="${potLink}" style="display:inline-block;background:#0a8a4a;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View Completed Pot</a>
-        <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
-      </div>
-    `
+    to: organizerEmail, subject: `🎉 Your pot is full! $${amount} in your wallet`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#0a8a4a">Your pot is full! 🎉</h2>
+      <p><strong>${potName}</strong> has reached its goal. <strong>$${amount}</strong> is now in your Pitch-In wallet.</p>
+      <p style="color:#666">Open the app to withdraw — free standard transfer or instant to your debit card.</p>
+      <a href="${potLink}" style="display:inline-block;background:#0a8a4a;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View &amp; Withdraw</a>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
   });
 }
 
 function emailContributorPotFilled(email, name, potName, potLink) {
   return sendEmail({
-    to: email,
-    subject: `🎉 ${potName} is full!`,
-    html: `
-      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-        <h2 style="color:#0a8a4a">The pot is full! 🎉</h2>
-        <p>Hey ${name}, <strong>${potName}</strong> has reached its goal! The organizer will receive the funds shortly.</p>
-        <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
-        <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
-      </div>
-    `
+    to: email, subject: `🎉 ${potName} is full!`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#0a8a4a">The pot is full! 🎉</h2>
+      <p>Hey ${name}, <strong>${potName}</strong> reached its goal! The organizer has been paid.</p>
+      <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
   });
 }
 
 function emailRefund(email, name, amount, potName) {
   return sendEmail({
-    to: email,
-    subject: `↩ Refund: $${amount} from ${potName} is on its way`,
-    html: `
-      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-        <h2 style="color:#c8193a">Pot expired — refund coming ↩</h2>
-        <p>Hey ${name}, <strong>${potName}</strong> didn't reach its goal in time.</p>
-        <p>Your <strong>$${amount}</strong> is being refunded to your original payment method. Expect it within 5-10 business days.</p>
-        <p style="color:#666">No fees were charged on this pot.</p>
-        <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
-      </div>
-    `
+    to: email, subject: `↩ Refund: $${amount} from ${potName} is on its way`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#c8193a">Pot expired — refund coming ↩</h2>
+      <p>Hey ${name}, <strong>${potName}</strong> didn't reach its goal in time.</p>
+      <p>Your <strong>$${amount}</strong> is being refunded. Expect it within 5-10 business days.</p>
+      <p style="color:#666">No fees charged on this pot.</p>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
   });
 }
 
-// ── OPEN GRAPH: Dynamic pot preview for link sharing ───────
+function emailWithdrawal(email, name, amount, method, arrivalDate) {
+  return sendEmail({
+    to: email, subject: `💸 $${amount} withdrawal initiated`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#2352e8">Withdrawal confirmed 💸</h2>
+      <p>Hey ${name}, <strong>$${amount}</strong> is on its way to your bank account.</p>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px;margin:16px 0">
+        <p style="margin:0;color:#166534">✓ Method: ${method}<br/>✓ Expected: ${arrivalDate}</p>
+      </div>
+      <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+    </div>`
+  });
+}
+
+// ── AUTH: Register ─────────────────────────────────────────
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { email, username, password } = req.body;
+    if (!email || !username || !password) return res.status(400).json({ error: 'All fields required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    // Check if email already exists
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (existing.rows.length) return res.status(400).json({ error: 'An account with this email already exists' });
+
+    const passwordHash = hashPassword(password);
+    const token = generateToken();
+    const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+
+    await pool.query(
+      'INSERT INTO users (email, username, password_hash, token, token_expires) VALUES ($1, $2, $3, $4, $5)',
+      [email.toLowerCase(), username, passwordHash, token, tokenExpires]
+    );
+
+    // Create wallet for new user
+    await pool.query(
+      'INSERT INTO wallets (email, display_name) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET display_name = $2',
+      [email.toLowerCase(), username]
+    );
+
+    sendEmail({
+      to: email,
+      subject: 'Welcome to Pitch-In! 🎉',
+      html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+        <h2 style="color:#2352e8">Welcome, ${username}! 💰</h2>
+        <p>Your Pitch-In account is ready. Create pots, pitch in with your group, and track everything in your wallet.</p>
+        <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
+      </div>`
+    }).catch(() => {});
+
+    res.json({ success: true, token, user: { email: email.toLowerCase(), username } });
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
+});
+
+// ── AUTH: Login ────────────────────────────────────────────
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length) return res.status(400).json({ error: 'No account found with this email' });
+
+    const user = result.rows[0];
+    if (!verifyPassword(password, user.password_hash)) {
+      return res.status(400).json({ error: 'Incorrect password' });
+    }
+
+    // Refresh token
+    const token = generateToken();
+    const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query('UPDATE users SET token=$1, token_expires=$2 WHERE email=$3', [token, tokenExpires, email.toLowerCase()]);
+
+    res.json({ success: true, token, user: { email: email.toLowerCase(), username: user.username } });
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
+});
+
+// ── AUTH: Verify token ─────────────────────────────────────
+app.post('/auth/verify', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+    const result = await pool.query(
+      'SELECT * FROM users WHERE token = $1 AND token_expires > NOW()',
+      [token]
+    );
+    if (!result.rows.length) return res.status(401).json({ error: 'Invalid or expired session' });
+    const user = result.rows[0];
+    res.json({ success: true, user: { email: user.email, username: user.username } });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── OPEN GRAPH ─────────────────────────────────────────────
 app.get('/og/:slug', async (req, res) => {
   try {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
@@ -134,32 +267,21 @@ app.get('/og/:slug', async (req, res) => {
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const pct = Math.min(100, Math.round(raised / pot.goal * 100));
     const link = `https://pitchinapp.netlify.app/app.html?pot=${req.params.slug}`;
-
-    // Return HTML page with Open Graph meta tags
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8"/>
-  <meta property="og:title" content="${pot.name} — Pitch In!"/>
-  <meta property="og:description" content="$${raised.toFixed(0)} of $${pot.goal} raised · ${pct}% funded · Tap to pitch in"/>
-  <meta property="og:url" content="${link}"/>
-  <meta property="og:type" content="website"/>
-  <meta property="og:image" content="https://pitchin-backend-cjat.onrender.com/og-image/${req.params.slug}"/>
-  <meta property="og:image:width" content="1200"/>
-  <meta property="og:image:height" content="630"/>
-  <meta name="twitter:card" content="summary_large_image"/>
-  <meta name="twitter:title" content="${pot.name} — Pitch In!"/>
-  <meta name="twitter:description" content="$${raised.toFixed(0)} of $${pot.goal} raised · ${pct}% funded"/>
-  <meta http-equiv="refresh" content="0;url=${link}"/>
-</head>
-<body><a href="${link}">Click here to view the pot</a></body>
-</html>`);
-  } catch (err) {
-    res.status(500).send('Error');
-  }
+    res.send(`<!DOCTYPE html><html><head>
+      <meta charset="UTF-8"/>
+      <meta property="og:title" content="${pot.name} — Pitch In!"/>
+      <meta property="og:description" content="$${raised.toFixed(0)} of $${pot.goal} raised · ${pct}% funded · Tap to pitch in"/>
+      <meta property="og:url" content="${link}"/>
+      <meta property="og:type" content="website"/>
+      <meta property="og:image" content="https://pitchin-backend-cjat.onrender.com/og-image/${req.params.slug}"/>
+      <meta property="og:image:width" content="1200"/>
+      <meta property="og:image:height" content="630"/>
+      <meta name="twitter:card" content="summary_large_image"/>
+      <meta http-equiv="refresh" content="0;url=${link}"/>
+    </head><body><a href="${link}">View pot</a></body></html>`);
+  } catch (err) { res.status(500).send('Error'); }
 });
 
-// Generate OG image as SVG
 app.get('/og-image/:slug', async (req, res) => {
   try {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
@@ -167,75 +289,134 @@ app.get('/og-image/:slug', async (req, res) => {
     const pot = result.rows[0].data;
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const pct = Math.min(100, Math.round(raised / pot.goal * 100));
-    const barWidth = Math.round(pct * 9.6); // 960px max bar
-
+    const barWidth = Math.round(pct * 9.6);
     res.setHeader('Content-Type', 'image/svg+xml');
     res.send(`<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
-  <rect width="1200" height="630" fill="#f7f8fc"/>
-  <rect x="60" y="60" width="1080" height="510" rx="24" fill="white" stroke="#e2e6f3" stroke-width="2"/>
-  <text x="100" y="160" font-family="Arial" font-size="52" font-weight="bold" fill="#0f1523">${pot.name.substring(0, 32)}</text>
-  <text x="100" y="220" font-family="Arial" font-size="28" fill="#6b7499">${pot.desc ? pot.desc.substring(0, 60) : 'Group payment pot'}</text>
-  <rect x="100" y="280" width="1000" height="20" rx="10" fill="#f0f2f9"/>
-  <rect x="100" y="280" width="${barWidth}" height="20" rx="10" fill="${pct >= 100 ? '#f59e0b' : '#2352e8'}"/>
-  <text x="100" y="350" font-family="Arial" font-size="36" font-weight="bold" fill="#2352e8">$${raised.toFixed(0)} raised</text>
-  <text x="100" y="395" font-family="Arial" font-size="28" fill="#6b7499">of $${pot.goal} goal · ${pct}% funded</text>
-  <rect x="100" y="440" width="280" height="72" rx="36" fill="#2352e8"/>
-  <text x="240" y="485" font-family="Arial" font-size="28" font-weight="bold" fill="white" text-anchor="middle">Pitch In →</text>
-  <text x="1100" y="545" font-family="Arial" font-size="22" fill="#8891b0" text-anchor="end">Pitch-In</text>
-</svg>`);
-  } catch (err) {
-    res.status(500).send('Error');
-  }
+      <rect width="1200" height="630" fill="#f7f8fc"/>
+      <rect x="60" y="60" width="1080" height="510" rx="24" fill="white" stroke="#e2e6f3" stroke-width="2"/>
+      <text x="100" y="160" font-family="Arial" font-size="52" font-weight="bold" fill="#0f1523">${pot.name.substring(0,32)}</text>
+      <text x="100" y="220" font-family="Arial" font-size="28" fill="#6b7499">${pot.desc ? pot.desc.substring(0,60) : 'Group payment pot'}</text>
+      <rect x="100" y="280" width="1000" height="20" rx="10" fill="#f0f2f9"/>
+      <rect x="100" y="280" width="${barWidth}" height="20" rx="10" fill="${pct>=100?'#f59e0b':'#2352e8'}"/>
+      <text x="100" y="350" font-family="Arial" font-size="36" font-weight="bold" fill="#2352e8">$${raised.toFixed(0)} raised</text>
+      <text x="100" y="395" font-family="Arial" font-size="28" fill="#6b7499">of $${pot.goal} goal · ${pct}% funded</text>
+      <rect x="100" y="440" width="280" height="72" rx="36" fill="#2352e8"/>
+      <text x="240" y="485" font-family="Arial" font-size="28" font-weight="bold" fill="white" text-anchor="middle">Pitch In →</text>
+      <text x="1100" y="545" font-family="Arial" font-size="22" fill="#8891b0" text-anchor="end">Pitch-In</text>
+    </svg>`);
+  } catch (err) { res.status(500).send('Error'); }
 });
 
-// ── ORGANIZER: Save payout card ────────────────────────────
-app.post('/save-organizer-card', async (req, res) => {
+// ── WALLET: Get or create ──────────────────────────────────
+app.post('/wallet/get-or-create', async (req, res) => {
   try {
-    const { email, paymentMethodId, last4, potId } = req.body;
+    const { email, displayName } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    let result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
+    if (!result.rows.length) {
+      await pool.query(
+        'INSERT INTO wallets (email, display_name) VALUES ($1, $2)',
+        [email, displayName || email.split('@')[0]]
+      );
+      result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
+      emailWelcome(email, displayName || email.split('@')[0]).catch(() => {});
+    } else if (displayName && !result.rows[0].display_name) {
+      await pool.query('UPDATE wallets SET display_name = $1 WHERE email = $2', [displayName, email]);
+      result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
+    }
+    const wallet = result.rows[0];
+    // Get recent transactions
+    const txResult = await pool.query(
+      'SELECT * FROM transactions WHERE email = $1 ORDER BY created_at DESC LIMIT 20',
+      [email]
+    );
+    res.json({ wallet, transactions: txResult.rows });
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
+});
 
-    // Create or get Stripe customer for organizer
+// ── WALLET: Save payout card ───────────────────────────────
+app.post('/wallet/save-card', async (req, res) => {
+  try {
+    const { email, paymentMethodId, last4 } = req.body;
     let customerId;
-    const existing = await pool.query('SELECT stripe_customer_id FROM organizers WHERE email = $1', [email]);
+    const existing = await pool.query('SELECT stripe_customer_id FROM wallets WHERE email = $1', [email]);
     if (existing.rows.length && existing.rows[0].stripe_customer_id) {
       customerId = existing.rows[0].stripe_customer_id;
-      // Update payment method
       await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
-      await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: paymentMethodId } });
     } else {
-      const customer = await stripe.customers.create({
-        email,
-        payment_method: paymentMethodId,
-        invoice_settings: { default_payment_method: paymentMethodId }
-      });
+      const customer = await stripe.customers.create({ email, payment_method: paymentMethodId });
       customerId = customer.id;
     }
+    await pool.query(
+      'UPDATE wallets SET stripe_customer_id=$1, payout_method_id=$2, payout_last4=$3, updated_at=NOW() WHERE email=$4',
+      [customerId, paymentMethodId, last4, email]
+    );
+    res.json({ success: true, last4 });
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
+});
 
-    await pool.query(`
-      INSERT INTO organizers (email, stripe_customer_id, payout_method_id, payout_last4)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (email) DO UPDATE SET
-        stripe_customer_id = $2, payout_method_id = $3, payout_last4 = $4
-    `, [email, customerId, paymentMethodId, last4]);
+// ── WALLET: Withdraw ───────────────────────────────────────
+app.post('/wallet/withdraw', async (req, res) => {
+  try {
+    const { email, amount, method } = req.body; // method: 'standard' or 'instant'
+    if (!email || !amount) return res.status(400).json({ error: 'Email and amount required' });
 
-    // Attach card to pot
-    if (potId) {
-      const slug = potId.slice(-8);
-      const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
-      if (potResult.rows.length) {
-        const pot = potResult.rows[0].data;
-        pot.organizerEmail = email;
-        pot.organizerCustomerId = customerId;
-        pot.organizerPayoutMethodId = paymentMethodId;
-        pot.organizerPayoutLast4 = last4;
-        await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-      }
+    const walletResult = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
+    if (!walletResult.rows.length) return res.status(404).json({ error: 'Wallet not found' });
+    const wallet = walletResult.rows[0];
+
+    if (parseFloat(wallet.balance) < parseFloat(amount)) {
+      return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    res.json({ success: true, customerId, last4 });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+    const amountCents = Math.round(parseFloat(amount) * 100);
+    const instantFee = method === 'instant' ? Math.round(amountCents * INSTANT_FEE) : 0;
+    const payoutCents = amountCents - instantFee;
+
+    // Create Stripe payout
+    const payoutParams = {
+      amount: payoutCents,
+      currency: 'usd',
+      method: method === 'instant' ? 'instant' : 'standard',
+      metadata: { email, walletWithdrawal: 'true' }
+    };
+
+    const payout = await stripe.payouts.create(payoutParams).catch(async (err) => {
+      if (method === 'instant') {
+        return stripe.payouts.create({ ...payoutParams, method: 'standard' });
+      }
+      throw err;
+    });
+
+    const arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric'
+    });
+
+    // Deduct from wallet
+    await pool.query(
+      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE email = $2',
+      [amount, email]
+    );
+
+    // Record transaction
+    await pool.query(
+      'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
+      [email, 'withdrawal', amount, instantFee / 100, `${method === 'instant' ? 'Instant' : 'Standard'} withdrawal`, payout.id]
+    );
+
+    // Send email
+    const displayName = wallet.display_name || email.split('@')[0];
+    emailWithdrawal(email, displayName, (payoutCents/100).toFixed(2), method === 'instant' ? 'Instant (30 min)' : 'Standard (next business day)', arrivalDate).catch(() => {});
+
+    res.json({
+      success: true,
+      amount: payoutCents / 100,
+      fee: instantFee / 100,
+      method: payout.method,
+      arrivalDate,
+      newBalance: parseFloat(wallet.balance) - parseFloat(amount)
+    });
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
 // ── POT: Save ──────────────────────────────────────────────
@@ -244,12 +425,12 @@ app.post('/save-pot', async (req, res) => {
     const { pot } = req.body;
     if (!pot || !pot.id) return res.status(400).json({ error: 'Invalid pot' });
     const slug = pot.id.slice(-8);
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
+    await pool.query(
+      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+      [slug, JSON.stringify(pot)]
+    );
     res.json({ success: true, slug });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
 // ── POT: Get ───────────────────────────────────────────────
@@ -258,31 +439,24 @@ app.get('/get-pot/:slug', async (req, res) => {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
     if (!result.rows.length) return res.status(404).json({ error: 'Pot not found' });
     res.json({ pot: result.rows[0].data });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
 // ── PAYMENTS: Create PaymentIntent ────────────────────────
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, potId, potName } = req.body;
-    const amountCents = Math.round(amount * 100);
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountCents,
+      amount: Math.round(amount * 100),
       currency: 'usd',
       metadata: { potId, potName },
       automatic_payment_methods: { enabled: true },
     });
     res.json({ clientSecret: paymentIntent.client_secret });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
-// ── PAYMENTS: Confirm contribution + check if pot is full ─
+// ── PAYMENTS: Confirm contribution ────────────────────────
 app.post('/confirm-contribution', async (req, res) => {
   try {
     const { potId, memberName, amount, paymentIntentId, email } = req.body;
@@ -291,7 +465,7 @@ app.post('/confirm-contribution', async (req, res) => {
     if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
     const pot = potResult.rows[0].data;
 
-    // Update member contribution
+    // Update member
     const existing = pot.members.find(m => m.name === memberName);
     if (existing) {
       existing.contributed = parseFloat(((existing.contributed || 0) + parseFloat(amount)).toFixed(2));
@@ -301,16 +475,27 @@ app.post('/confirm-contribution', async (req, res) => {
       pot.members.push({ name: memberName, contributed: parseFloat(amount), paymentIntentId, email: email || null });
     }
 
-    // Save updated pot
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-    // Send confirmation email to contributor
-    const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
+    // Track contributor wallet
     if (email) {
-      emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
+      await pool.query(
+        'INSERT INTO wallets (email, display_name, total_contributed) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET total_contributed = wallets.total_contributed + $3, updated_at = NOW()',
+        [email, memberName, amount]
+      );
+      await pool.query(
+        'INSERT INTO transactions (email, type, amount, description, pot_slug, pot_name) VALUES ($1, $2, $3, $4, $5, $6)',
+        [email, 'contribution', amount, `Pitched in to ${pot.name}`, slug, pot.name]
+      );
     }
 
-    // Check if pot is now full
+    await pool.query(
+      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+      [slug, JSON.stringify(pot)]
+    );
+
+    const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
+    if (email) emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
+
+    // Check if pot is full
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const isFull = raised >= pot.goal;
 
@@ -318,72 +503,61 @@ app.post('/confirm-contribution', async (req, res) => {
       pot.released = true;
       pot.releasedAt = new Date().toISOString();
 
-      // Calculate Pitch-In fee
-      const totalCents = Math.round(raised * 100);
-      const feeCents = Math.round(totalCents * PLATFORM_FEE);
-      const payoutCents = totalCents - feeCents;
+      const feeCents = Math.round(raised * 100 * PLATFORM_FEE);
+      const organizerAmount = parseFloat(((raised * 100 - feeCents) / 100).toFixed(2));
 
-      // Instant payout to organizer's saved card if available
-      let payoutResult = null;
-      if (pot.organizerCustomerId && pot.organizerPayoutMethodId) {
-        try {
-          // Create a payout via Stripe
-          const transfer = await stripe.payouts.create({
-            amount: payoutCents,
-            currency: 'usd',
-            method: 'instant',
-            destination: pot.organizerPayoutMethodId,
-          }, {
-            stripeAccount: pot.organizerCustomerId
-          });
-          payoutResult = { status: 'instant', transfer: transfer.id };
-          pot.payoutStatus = 'instant';
-        } catch (payoutErr) {
-          console.warn('Instant payout failed, trying standard:', payoutErr.message);
-          payoutResult = { status: 'pending', error: payoutErr.message };
-          pot.payoutStatus = 'pending';
-        }
-      }
-
-      // Save final pot state
-      await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-      // Email organizer
+      // Credit organizer wallet instantly
       if (pot.organizerEmail) {
-        emailPotFilled(pot.organizerEmail, pot.name, raised.toFixed(2), potLink).catch(() => {});
+        await pool.query(
+          `INSERT INTO wallets (email, display_name, balance, total_earned)
+           VALUES ($1, $2, $3, $3)
+           ON CONFLICT (email) DO UPDATE SET
+             balance = wallets.balance + $3,
+             total_earned = wallets.total_earned + $3,
+             updated_at = NOW()`,
+          [pot.organizerEmail, pot.organizerEmail.split('@')[0], organizerAmount]
+        );
+        await pool.query(
+          'INSERT INTO transactions (email, type, amount, fee, description, pot_slug, pot_name) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [pot.organizerEmail, 'pot_earned', organizerAmount, raised * PLATFORM_FEE, `${pot.name} completed`, slug, pot.name]
+        );
+        pot.payoutStatus = 'in_wallet';
+        emailPotFilled(pot.organizerEmail, pot.name, organizerAmount.toFixed(2), potLink).catch(() => {});
       }
 
-      // Email all contributors
+      // Notify all contributors
       pot.members.forEach(m => {
-        if (m.email && m.name !== 'You') {
+        if (m.email && m.email !== pot.organizerEmail) {
           emailContributorPotFilled(m.email, m.name, pot.name, potLink).catch(() => {});
         }
       });
 
-      return res.json({ success: true, potFull: true, raised, payoutResult });
+      await pool.query(
+        'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+        [slug, JSON.stringify(pot)]
+      );
+
+      return res.json({ success: true, potFull: true, raised, organizerAmount });
     }
 
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
+    await pool.query(
+      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+      [slug, JSON.stringify(pot)]
+    );
     res.json({ success: true, potFull: false, raised });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
-// ── PAYMENTS: Early withdrawal ─────────────────────────────
+// ── PAYMENTS: Refund ───────────────────────────────────────
 app.post('/withdraw', async (req, res) => {
   try {
     const { paymentIntentId } = req.body;
     const refund = await stripe.refunds.create({ payment_intent: paymentIntentId });
     res.json({ refund });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
-// ── PAYMENTS: Refund expired pot ───────────────────────────
+// ── PAYMENTS: Refund expired pot ──────────────────────────
 app.post('/refund-expired-pot', async (req, res) => {
   try {
     const { potId } = req.body;
@@ -401,10 +575,7 @@ app.post('/refund-expired-pot', async (req, res) => {
           member.refunded = true;
           member.refundId = refund.id;
           results.push({ name: member.name, status: 'refunded', amount: member.contributed });
-          // Email refund notification
-          if (member.email) {
-            emailRefund(member.email, member.name, member.contributed, pot.name).catch(() => {});
-          }
+          if (member.email) emailRefund(member.email, member.name, member.contributed, pot.name).catch(() => {});
         } catch (e) {
           results.push({ name: member.name, status: 'error', error: e.message });
         }
@@ -413,68 +584,12 @@ app.post('/refund-expired-pot', async (req, res) => {
 
     pot.refunded = true;
     pot.refundedAt = new Date().toISOString();
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
+    await pool.query(
+      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+      [slug, JSON.stringify(pot)]
+    );
     res.json({ success: true, results });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Organizer claims payout to their debit card
-app.post('/claim-payout', async (req, res) => {
-  try {
-    const { potId, email } = req.body;
-    const slug = potId.slice(-8);
-    const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
-    if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
-    const pot = potResult.rows[0].data;
-    if (!pot.released) return res.status(400).json({ error: 'Pot not complete yet' });
-    if (pot.payoutClaimed) return res.status(400).json({ error: 'Payout already claimed' });
-
-    const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
-    const feeCents = Math.round(raised * 100 * PLATFORM_FEE);
-    const payoutCents = Math.round(raised * 100) - feeCents;
-
-    // Mark pot as claimed immediately to prevent double claims
-    pot.payoutClaimed = true;
-    pot.payoutClaimedAt = new Date().toISOString();
-    pot.organizerEmail = email || pot.organizerEmail;
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-    // Create a payout from YOUR Stripe balance to YOUR bank account
-    // This is the correct way — Stripe platform payouts go to the platform's bank
-    // The organizer IS you for now, money goes to your connected bank
-    const payout = await stripe.payouts.create({
-      amount: payoutCents,
-      currency: 'usd',
-      method: 'standard', // standard = next business day, instant = 30min (needs limit)
-      metadata: { potId, potName: pot.name, organizerEmail: email || pot.organizerEmail || '' }
-    });
-
-    pot.payoutId = payout.id;
-    pot.payoutStatus = payout.method;
-    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-    const arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-
-    // Send confirmation email
-    const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
-    if (email || pot.organizerEmail) {
-      emailPotFilled(email || pot.organizerEmail, pot.name, (payoutCents / 100).toFixed(2), potLink).catch(() => {});
-    }
-
-    res.json({ 
-      success: true, 
-      amount: payoutCents / 100,
-      method: payout.method,
-      arrivalDate,
-      payoutId: payout.id
-    });
-  } catch (err) {
-    console.error('Claim payout error:', err);
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
 app.get('/', (req, res) => res.send('Pitch-In backend running'));
