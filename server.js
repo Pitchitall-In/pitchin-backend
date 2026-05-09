@@ -151,5 +151,43 @@ app.post('/withdraw', async (req, res) => {
   }
 });
 
+app.post('/refund-expired-pot', async (req, res) => {
+  try {
+    const { potId } = req.body;
+    const potSlug = potId.slice(-8);
+    const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [potSlug]);
+    if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
+    const pot = potResult.rows[0].data;
+
+    if (pot.refunded) return res.json({ success: true, message: 'Already refunded' });
+
+    const results = [];
+    for (const member of pot.members) {
+      if (member.paymentIntentId && member.contributed > 0) {
+        try {
+          const refund = await stripe.refunds.create({ payment_intent: member.paymentIntentId });
+          member.refunded = true;
+          member.refundId = refund.id;
+          results.push({ name: member.name, status: 'refunded', amount: member.contributed });
+        } catch (e) {
+          results.push({ name: member.name, status: 'error', error: e.message });
+        }
+      }
+    }
+
+    pot.refunded = true;
+    pot.refundedAt = new Date().toISOString();
+    await pool.query(
+      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
+      [potSlug, JSON.stringify(pot)]
+    );
+
+    res.json({ success: true, results });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Pitch-In backend on port ${PORT}`));
