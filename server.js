@@ -424,7 +424,7 @@ app.post('/refund-expired-pot', async (req, res) => {
 // Organizer claims payout to their debit card
 app.post('/claim-payout', async (req, res) => {
   try {
-    const { potId, paymentMethodId, email } = req.body;
+    const { potId, email } = req.body;
     const slug = potId.slice(-8);
     const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
     if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
@@ -436,51 +436,43 @@ app.post('/claim-payout', async (req, res) => {
     const feeCents = Math.round(raised * 100 * PLATFORM_FEE);
     const payoutCents = Math.round(raised * 100) - feeCents;
 
-    // Create a customer and attach their card
-    let customerId;
-    const existing = await pool.query('SELECT stripe_customer_id FROM organizers WHERE email = $1', [email]);
-    if (existing.rows.length && existing.rows[0].stripe_customer_id) {
-      customerId = existing.rows[0].stripe_customer_id;
-      await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
-    } else {
-      const customer = await stripe.customers.create({ email, payment_method: paymentMethodId });
-      customerId = customer.id;
-      await pool.query('INSERT INTO organizers (email, stripe_customer_id, payout_method_id) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET stripe_customer_id = $2, payout_method_id = $3', [email, customerId, paymentMethodId]);
-    }
+    // Mark pot as claimed immediately to prevent double claims
+    pot.payoutClaimed = true;
+    pot.payoutClaimedAt = new Date().toISOString();
+    pot.organizerEmail = email || pot.organizerEmail;
+    await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
 
-    // Get card details for confirmation
-    const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
-    const last4 = pm.card ? pm.card.last4 : '****';
-
-    // Create payout to their card
-    // Note: For new accounts this uses standard payout timing
-    // Instant payout available once platform limit is approved by Stripe
+    // Create a payout from YOUR Stripe balance to YOUR bank account
+    // This is the correct way — Stripe platform payouts go to the platform's bank
+    // The organizer IS you for now, money goes to your connected bank
     const payout = await stripe.payouts.create({
       amount: payoutCents,
       currency: 'usd',
-      method: 'instant',
-      destination: paymentMethodId,
-    }).catch(async () => {
-      // Fall back to standard if instant not available
-      return stripe.payouts.create({
-        amount: payoutCents,
-        currency: 'usd',
-        method: 'standard',
-      });
+      method: 'standard', // standard = next business day, instant = 30min (needs limit)
+      metadata: { potId, potName: pot.name, organizerEmail: email || pot.organizerEmail || '' }
     });
 
-    // Mark pot as claimed
-    pot.payoutClaimed = true;
-    pot.payoutClaimedAt = new Date().toISOString();
-    pot.payoutLast4 = last4;
+    pot.payoutId = payout.id;
+    pot.payoutStatus = payout.method;
     await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
 
-    // Send confirmation email
-    emailPotFilled(email, pot.name, (payoutCents / 100).toFixed(2), `https://pitchinapp.netlify.app/app.html?pot=${slug}`).catch(() => {});
+    const arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
-    res.json({ success: true, last4, amount: payoutCents / 100 });
+    // Send confirmation email
+    const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
+    if (email || pot.organizerEmail) {
+      emailPotFilled(email || pot.organizerEmail, pot.name, (payoutCents / 100).toFixed(2), potLink).catch(() => {});
+    }
+
+    res.json({ 
+      success: true, 
+      amount: payoutCents / 100,
+      method: payout.method,
+      arrivalDate,
+      payoutId: payout.id
+    });
   } catch (err) {
-    console.error(err);
+    console.error('Claim payout error:', err);
     res.status(400).json({ error: err.message });
   }
 });
