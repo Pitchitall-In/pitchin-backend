@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 
 const app = express();
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const PLATFORM_FEE = 0.02; // 2%
+const PLATFORM_FEE = 0.02;
 
 app.use(cors({
   origin: ['https://pitchinapp.netlify.app', 'http://localhost:3000'],
@@ -40,7 +40,6 @@ async function initDB() {
 }
 initDB().catch(console.error);
 
-// ── EMAIL ──────────────────────────────────────────────────
 async function sendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY || !to) return;
   try {
@@ -51,7 +50,7 @@ async function sendEmail({ to, subject, html }) {
         'Authorization': `Bearer ${RESEND_API_KEY}`
       },
       body: JSON.stringify({
-        from: 'Pitch-In <noreply@pitchinapp.netlify.app>',
+        from: 'Pitch-In <onboarding@resend.dev>',
         to,
         subject,
         html
@@ -125,7 +124,6 @@ function emailRefund(email, name, amount, potName) {
   });
 }
 
-// ── OPEN GRAPH: Dynamic pot preview for link sharing ───────
 app.get('/og/:slug', async (req, res) => {
   try {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
@@ -134,8 +132,6 @@ app.get('/og/:slug', async (req, res) => {
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const pct = Math.min(100, Math.round(raised / pot.goal * 100));
     const link = `https://pitchinapp.netlify.app/app.html?pot=${req.params.slug}`;
-
-    // Return HTML page with Open Graph meta tags
     res.send(`<!DOCTYPE html>
 <html>
 <head>
@@ -159,7 +155,6 @@ app.get('/og/:slug', async (req, res) => {
   }
 });
 
-// Generate OG image as SVG
 app.get('/og-image/:slug', async (req, res) => {
   try {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
@@ -167,8 +162,7 @@ app.get('/og-image/:slug', async (req, res) => {
     const pot = result.rows[0].data;
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const pct = Math.min(100, Math.round(raised / pot.goal * 100));
-    const barWidth = Math.round(pct * 9.6); // 960px max bar
-
+    const barWidth = Math.round(pct * 9.6);
     res.setHeader('Content-Type', 'image/svg+xml');
     res.send(`<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
   <rect width="1200" height="630" fill="#f7f8fc"/>
@@ -188,17 +182,13 @@ app.get('/og-image/:slug', async (req, res) => {
   }
 });
 
-// ── ORGANIZER: Save payout card ────────────────────────────
 app.post('/save-organizer-card', async (req, res) => {
   try {
     const { email, paymentMethodId, last4, potId } = req.body;
-
-    // Create or get Stripe customer for organizer
     let customerId;
     const existing = await pool.query('SELECT stripe_customer_id FROM organizers WHERE email = $1', [email]);
     if (existing.rows.length && existing.rows[0].stripe_customer_id) {
       customerId = existing.rows[0].stripe_customer_id;
-      // Update payment method
       await stripe.paymentMethods.attach(paymentMethodId, { customer: customerId });
       await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: paymentMethodId } });
     } else {
@@ -209,15 +199,12 @@ app.post('/save-organizer-card', async (req, res) => {
       });
       customerId = customer.id;
     }
-
     await pool.query(`
       INSERT INTO organizers (email, stripe_customer_id, payout_method_id, payout_last4)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (email) DO UPDATE SET
         stripe_customer_id = $2, payout_method_id = $3, payout_last4 = $4
     `, [email, customerId, paymentMethodId, last4]);
-
-    // Attach card to pot
     if (potId) {
       const slug = potId.slice(-8);
       const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
@@ -230,7 +217,6 @@ app.post('/save-organizer-card', async (req, res) => {
         await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
       }
     }
-
     res.json({ success: true, customerId, last4 });
   } catch (err) {
     console.error(err);
@@ -238,7 +224,6 @@ app.post('/save-organizer-card', async (req, res) => {
   }
 });
 
-// ── POT: Save ──────────────────────────────────────────────
 app.post('/save-pot', async (req, res) => {
   try {
     const { pot } = req.body;
@@ -252,7 +237,6 @@ app.post('/save-pot', async (req, res) => {
   }
 });
 
-// ── POT: Get ───────────────────────────────────────────────
 app.get('/get-pot/:slug', async (req, res) => {
   try {
     const result = await pool.query('SELECT data FROM pots WHERE slug = $1', [req.params.slug]);
@@ -264,7 +248,6 @@ app.get('/get-pot/:slug', async (req, res) => {
   }
 });
 
-// ── PAYMENTS: Create PaymentIntent ────────────────────────
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, potId, potName } = req.body;
@@ -282,7 +265,6 @@ app.post('/create-payment-intent', async (req, res) => {
   }
 });
 
-// ── PAYMENTS: Confirm contribution + check if pot is full ─
 app.post('/confirm-contribution', async (req, res) => {
   try {
     const { potId, memberName, amount, paymentIntentId, email } = req.body;
@@ -290,8 +272,6 @@ app.post('/confirm-contribution', async (req, res) => {
     const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
     if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
     const pot = potResult.rows[0].data;
-
-    // Update member contribution
     const existing = pot.members.find(m => m.name === memberName);
     if (existing) {
       existing.contributed = parseFloat(((existing.contributed || 0) + parseFloat(amount)).toFixed(2));
@@ -300,69 +280,41 @@ app.post('/confirm-contribution', async (req, res) => {
     } else {
       pot.members.push({ name: memberName, contributed: parseFloat(amount), paymentIntentId, email: email || null });
     }
-
-    // Save updated pot
     await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-    // Send confirmation email to contributor
     const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
-    if (email) {
-      emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
-    }
-
-    // Check if pot is now full
+    if (email) emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const isFull = raised >= pot.goal;
-
     if (isFull && !pot.released) {
       pot.released = true;
       pot.releasedAt = new Date().toISOString();
-
-      // Calculate Pitch-In fee
       const totalCents = Math.round(raised * 100);
       const feeCents = Math.round(totalCents * PLATFORM_FEE);
       const payoutCents = totalCents - feeCents;
-
-      // Instant payout to organizer's saved card if available
       let payoutResult = null;
       if (pot.organizerCustomerId && pot.organizerPayoutMethodId) {
         try {
-          // Create a payout via Stripe
           const transfer = await stripe.payouts.create({
             amount: payoutCents,
             currency: 'usd',
             method: 'instant',
             destination: pot.organizerPayoutMethodId,
-          }, {
-            stripeAccount: pot.organizerCustomerId
-          });
+          }, { stripeAccount: pot.organizerCustomerId });
           payoutResult = { status: 'instant', transfer: transfer.id };
           pot.payoutStatus = 'instant';
         } catch (payoutErr) {
-          console.warn('Instant payout failed, trying standard:', payoutErr.message);
+          console.warn('Instant payout failed:', payoutErr.message);
           payoutResult = { status: 'pending', error: payoutErr.message };
           pot.payoutStatus = 'pending';
         }
       }
-
-      // Save final pot state
       await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
-
-      // Email organizer
-      if (pot.organizerEmail) {
-        emailPotFilled(pot.organizerEmail, pot.name, raised.toFixed(2), potLink).catch(() => {});
-      }
-
-      // Email all contributors
+      if (pot.organizerEmail) emailPotFilled(pot.organizerEmail, pot.name, raised.toFixed(2), potLink).catch(() => {});
       pot.members.forEach(m => {
-        if (m.email && m.name !== 'You') {
-          emailContributorPotFilled(m.email, m.name, pot.name, potLink).catch(() => {});
-        }
+        if (m.email && m.name !== 'You') emailContributorPotFilled(m.email, m.name, pot.name, potLink).catch(() => {});
       });
-
       return res.json({ success: true, potFull: true, raised, payoutResult });
     }
-
     await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
     res.json({ success: true, potFull: false, raised });
   } catch (err) {
@@ -371,7 +323,6 @@ app.post('/confirm-contribution', async (req, res) => {
   }
 });
 
-// ── PAYMENTS: Early withdrawal ─────────────────────────────
 app.post('/withdraw', async (req, res) => {
   try {
     const { paymentIntentId } = req.body;
@@ -383,7 +334,6 @@ app.post('/withdraw', async (req, res) => {
   }
 });
 
-// ── PAYMENTS: Refund expired pot ───────────────────────────
 app.post('/refund-expired-pot', async (req, res) => {
   try {
     const { potId } = req.body;
@@ -392,7 +342,6 @@ app.post('/refund-expired-pot', async (req, res) => {
     if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
     const pot = potResult.rows[0].data;
     if (pot.refunded) return res.json({ success: true, message: 'Already refunded' });
-
     const results = [];
     for (const member of pot.members) {
       if (member.paymentIntentId && member.contributed > 0) {
@@ -401,16 +350,12 @@ app.post('/refund-expired-pot', async (req, res) => {
           member.refunded = true;
           member.refundId = refund.id;
           results.push({ name: member.name, status: 'refunded', amount: member.contributed });
-          // Email refund notification
-          if (member.email) {
-            emailRefund(member.email, member.name, member.contributed, pot.name).catch(() => {});
-          }
+          if (member.email) emailRefund(member.email, member.name, member.contributed, pot.name).catch(() => {});
         } catch (e) {
           results.push({ name: member.name, status: 'error', error: e.message });
         }
       }
     }
-
     pot.refunded = true;
     pot.refundedAt = new Date().toISOString();
     await pool.query('INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()', [slug, JSON.stringify(pot)]);
