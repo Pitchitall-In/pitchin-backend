@@ -601,62 +601,14 @@ app.get('/get-pot/:slug', async (req, res) => {
 // ── PAYMENTS: Create PaymentIntent ────────────────────────
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount, potId, potName, deadline } = req.body;
-    // Use manual capture for pots under 7 days (auth hold model)
-    // Use immediate capture for pots over 7 days (charge + refund model)
-    const hoursUntilDeadline = deadline ? (deadline - Date.now()) / (1000 * 60 * 60) : 0;
-    const useAuthCapture = hoursUntilDeadline > 0 && hoursUntilDeadline <= 167; // under 7 days
-
-    const intentParams = {
+    const { amount, potId, potName } = req.body;
+    const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency: 'usd',
-      metadata: { potId, potName, useAuthCapture: useAuthCapture ? 'true' : 'false' },
+      metadata: { potId, potName },
       automatic_payment_methods: { enabled: true },
-    };
-
-    if (useAuthCapture) {
-      intentParams.capture_method = 'manual'; // authorize only, don't charge yet
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create(intentParams);
-    res.json({ clientSecret: paymentIntent.client_secret, useAuthCapture });
-  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
-});
-
-// Capture all authorized payments when pot fills
-app.post('/capture-pot-payments', async (req, res) => {
-  try {
-    const { potId } = req.body;
-    const slug = potId.slice(-8);
-    const potResult = await pool.query('SELECT data FROM pots WHERE slug = $1', [slug]);
-    if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
-    const pot = potResult.rows[0].data;
-
-    const results = [];
-    for (const member of pot.members) {
-      if (member.paymentIntentId && member.contributed > 0 && !member.captured) {
-        try {
-          const pi = await stripe.paymentIntents.retrieve(member.paymentIntentId);
-          if (pi.capture_method === 'manual' && pi.status === 'requires_capture') {
-            await stripe.paymentIntents.capture(member.paymentIntentId);
-            member.captured = true;
-            results.push({ name: member.name, status: 'captured', amount: member.contributed });
-          } else {
-            // Already captured (immediate charge model)
-            member.captured = true;
-            results.push({ name: member.name, status: 'already_captured' });
-          }
-        } catch (e) {
-          results.push({ name: member.name, status: 'error', error: e.message });
-        }
-      }
-    }
-
-    await pool.query(
-      'INSERT INTO pots (slug, data, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (slug) DO UPDATE SET data = $2, updated_at = NOW()',
-      [slug, JSON.stringify(pot)]
-    );
-    res.json({ success: true, results });
+    });
+    res.json({ clientSecret: paymentIntent.client_secret, useAuthCapture: false });
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
@@ -706,21 +658,6 @@ app.post('/confirm-contribution', async (req, res) => {
     if (isFull && !pot.released) {
       pot.released = true;
       pot.releasedAt = new Date().toISOString();
-
-      // Capture all authorized payments first
-      for (const member of pot.members) {
-        if (member.paymentIntentId && member.contributed > 0 && !member.captured) {
-          try {
-            const pi = await stripe.paymentIntents.retrieve(member.paymentIntentId);
-            if (pi.capture_method === 'manual' && pi.status === 'requires_capture') {
-              await stripe.paymentIntents.capture(member.paymentIntentId);
-            }
-            member.captured = true;
-          } catch (e) {
-            console.warn('Capture error for', member.name, e.message);
-          }
-        }
-      }
 
       const feeCents = Math.round(raised * 100 * PLATFORM_FEE);
       const organizerAmount = parseFloat(((raised * 100 - feeCents) / 100).toFixed(2));
@@ -790,20 +727,10 @@ app.post('/refund-expired-pot', async (req, res) => {
     for (const member of pot.members) {
       if (member.paymentIntentId && member.contributed > 0) {
         try {
-          const pi = await stripe.paymentIntents.retrieve(member.paymentIntentId);
-          if (pi.capture_method === 'manual' && pi.status === 'requires_capture') {
-            // Authorization hold — just cancel it, no refund needed, nothing was charged
-            await stripe.paymentIntents.cancel(member.paymentIntentId);
-            member.refunded = true;
-            member.refundId = 'auth_cancelled';
-            results.push({ name: member.name, status: 'authorization_cancelled', amount: member.contributed });
-          } else if (pi.status === 'succeeded') {
-            // Already captured — do a real refund
-            const refund = await stripe.refunds.create({ payment_intent: member.paymentIntentId });
-            member.refunded = true;
-            member.refundId = refund.id;
-            results.push({ name: member.name, status: 'refunded', amount: member.contributed });
-          }
+          const refund = await stripe.refunds.create({ payment_intent: member.paymentIntentId });
+          member.refunded = true;
+          member.refundId = refund.id;
+          results.push({ name: member.name, status: 'refunded', amount: member.contributed });
           if (member.email) emailRefund(member.email, member.name, member.contributed, pot.name).catch(() => {});
         } catch (e) {
           results.push({ name: member.name, status: 'error', error: e.message });
