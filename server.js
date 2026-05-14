@@ -392,7 +392,8 @@ async function moovRequest(method, path, body) {
     headers: {
       'Authorization': `Basic ${credentials}`,
       'Content-Type': 'application/json',
-      'X-Wait-For': 'rail-response'
+      'X-Moov-Version': 'v2024.01.00',
+      'X-Wait-For': 'payment-method'
     },
     body: body ? JSON.stringify(body) : undefined
   });
@@ -422,7 +423,7 @@ async function getOrCreateMoovAccount(email, displayName) {
         email
       }
     },
-    requestedCapabilities: ['send-funds', 'collect-funds'],
+    requestedCapabilities: ['send-funds', 'send-funds.push-to-card', 'collect-funds', 'collect-funds.card-payments', 'wallet'],
     foreignID: email.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)
   });
 
@@ -431,6 +432,13 @@ async function getOrCreateMoovAccount(email, displayName) {
   if (response.status === 200 || response.status === 201) {
     const moovAccountId = response.data.accountID;
     await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
+
+    // Request capabilities for the new account
+    const capResponse = await moovRequest('POST', `/accounts/${moovAccountId}/capabilities`, {
+      capabilities: ['send-funds', 'send-funds.push-to-card', 'collect-funds', 'collect-funds.card-payments', 'wallet']
+    });
+    console.log('Moov capabilities request:', capResponse.status, JSON.stringify(capResponse.data).substring(0, 200));
+
     return moovAccountId;
   }
 
@@ -847,6 +855,16 @@ app.get('/get-payment-intent/:id', async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Temporary fix: clear bad Moov account IDs
+app.post('/admin/clear-moov-ids', async (req, res) => {
+  try {
+    const result = await pool.query('UPDATE wallets SET moov_account_id = NULL');
+    res.json({ success: true, cleared: result.rowCount });
+  } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
