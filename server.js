@@ -462,20 +462,16 @@ app.post('/moov/token', async (req, res) => {
   }
 });
 
-// Save card to Moov account
 app.post('/moov/save-card', async (req, res) => {
   try {
-    const { email, cardNumber, expMonth, expYear, cvv, holderName, last4, brand } = req.body;
+    const { email, cardNumber, expMonth, expYear, cvv, holderName, billingZip, last4, brand } = req.body;
     const moovAccountId = await getOrCreateMoovAccount(email, holderName || '');
 
-    const nameParts = (holderName || 'Card Holder').split(' ');
-
-    // Add card to Moov account
     const cardResponse = await moovRequest('POST', `/accounts/${moovAccountId}/cards`, {
       cardNumber,
       expiration: {
-        month: expMonth,
-        year: expYear.slice(-2)
+        month: expMonth.padStart(2,'0'),
+        year: (expYear.length === 2 ? '20' + expYear : expYear).slice(-2)
       },
       cardCvv: cvv,
       holderName,
@@ -483,26 +479,24 @@ app.post('/moov/save-card', async (req, res) => {
         addressLine1: '123 Main St',
         city: 'Los Angeles',
         stateOrProvince: 'CA',
-        postalCode: '90001',
+        postalCode: billingZip || '90001',
         country: 'US'
       }
     });
 
+    console.log('Moov card response:', cardResponse.status, JSON.stringify(cardResponse.data));
+
     if (cardResponse.status !== 200 && cardResponse.status !== 201) {
-      console.error('Moov card error:', JSON.stringify(cardResponse.data));
-      return res.status(400).json({ error: 'Could not save card. Please check your card details.' });
+      const errMsg = cardResponse.data?.error || cardResponse.data?.message || JSON.stringify(cardResponse.data);
+      return res.status(400).json({ error: 'Could not save card: ' + errMsg });
     }
 
-    const cardId = cardResponse.data.cardID;
-
-    // Save last4 and brand to wallet for display
     await pool.query(
       'UPDATE wallets SET payout_last4 = $1, updated_at = NOW() WHERE email = $2',
       [last4, email]
     );
 
-    // Get payment methods to find the push-to-card method
-    await new Promise(resolve => setTimeout(resolve, 1500)); // wait for Moov to process
+    await new Promise(resolve => setTimeout(resolve, 2000));
     const pmResponse = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
     const methods = Array.isArray(pmResponse.data) ? pmResponse.data : [];
     const pushMethod = methods.find(pm =>
@@ -512,7 +506,7 @@ app.post('/moov/save-card', async (req, res) => {
 
     res.json({
       success: true,
-      cardId,
+      cardId: cardResponse.data.cardID,
       paymentMethodId: pushMethod ? pushMethod.paymentMethodID : null,
       last4,
       brand
