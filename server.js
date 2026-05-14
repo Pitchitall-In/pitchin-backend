@@ -403,32 +403,47 @@ async function moovRequest(method, path, body) {
 
 // Create or get Moov account for organizer
 async function getOrCreateMoovAccount(email, displayName) {
-  // Check if we already have a Moov account ID stored
   const result = await pool.query('SELECT moov_account_id FROM wallets WHERE email = $1', [email]);
   if (result.rows.length && result.rows[0].moov_account_id) {
+    console.log('Existing Moov account:', result.rows[0].moov_account_id);
     return result.rows[0].moov_account_id;
   }
-  // Create new Moov account
+
   const nameParts = (displayName || email.split('@')[0]).split(' ');
+  const firstName = nameParts[0] || 'User';
+  const lastName = nameParts[1] || 'PitchIn';
+
+  console.log('Creating Moov account for:', email);
   const response = await moovRequest('POST', '/accounts', {
     accountType: 'individual',
     profile: {
       individual: {
-        name: {
-          firstName: nameParts[0] || 'User',
-          lastName: nameParts[1] || 'Pitch-In'
-        },
+        name: { firstName, lastName },
         email
       }
     },
-    capabilities: ['send-funds', 'collect-funds'],
-    foreignID: email
+    requestedCapabilities: ['send-funds', 'collect-funds'],
+    foreignID: email.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)
   });
+
+  console.log('Moov create account response:', response.status, JSON.stringify(response.data).substring(0, 200));
+
   if (response.status === 200 || response.status === 201) {
     const moovAccountId = response.data.accountID;
     await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
     return moovAccountId;
   }
+
+  // Check if account already exists with this foreignID
+  if (response.status === 409 || (response.data && response.data.error && response.data.error.includes('already'))) {
+    const listResponse = await moovRequest('GET', `/accounts?foreignID=${email.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)}`);
+    if (listResponse.data && listResponse.data.length > 0) {
+      const moovAccountId = listResponse.data[0].accountID;
+      await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
+      return moovAccountId;
+    }
+  }
+
   throw new Error('Could not create Moov account: ' + JSON.stringify(response.data));
 }
 
@@ -466,6 +481,7 @@ app.post('/moov/save-card', async (req, res) => {
   try {
     const { email, cardNumber, expMonth, expYear, cvv, holderName, billingZip, last4, brand } = req.body;
     const moovAccountId = await getOrCreateMoovAccount(email, holderName || '');
+    console.log('Saving card for Moov account:', moovAccountId);
 
     const cardResponse = await moovRequest('POST', `/accounts/${moovAccountId}/cards`, {
       cardNumber,
