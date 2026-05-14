@@ -432,16 +432,93 @@ async function getOrCreateMoovAccount(email, displayName) {
   throw new Error('Could not create Moov account: ' + JSON.stringify(response.data));
 }
 
-// Get Moov link token for user to add payment method
-app.post('/moov/link-token', async (req, res) => {
+// Get Moov token for frontend card entry
+app.post('/moov/token', async (req, res) => {
   try {
     const { email, displayName } = req.body;
     const moovAccountId = await getOrCreateMoovAccount(email, displayName);
-    // Create a link token for the frontend to use Moov Drop-in UI
-    const response = await moovRequest('POST', `/accounts/${MOOV_ACCOUNT_ID}/transfers`, null);
-    res.json({ success: true, moovAccountId });
+
+    // Create a scoped token for this account so frontend can use moov.js
+    const tokenResponse = await moovRequest('POST', `/accounts/${moovAccountId}/access-token`, {
+      scopes: [
+        `/accounts/${moovAccountId}/cards.write`,
+        `/accounts/${moovAccountId}/payment-methods.read`
+      ]
+    });
+
+    if (tokenResponse.status !== 200 && tokenResponse.status !== 201) {
+      // Fallback — return account ID so frontend can still attempt
+      return res.json({ moovAccountId, token: null });
+    }
+
+    res.json({
+      moovAccountId,
+      token: tokenResponse.data.accessToken,
+      moovPublicKey: MOOV_PUBLIC_KEY
+    });
   } catch (err) {
-    console.error('Moov link token error:', err);
+    console.error('Moov token error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Save card to Moov account
+app.post('/moov/save-card', async (req, res) => {
+  try {
+    const { email, cardNumber, expMonth, expYear, cvv, holderName, last4, brand } = req.body;
+    const moovAccountId = await getOrCreateMoovAccount(email, holderName || '');
+
+    const nameParts = (holderName || 'Card Holder').split(' ');
+
+    // Add card to Moov account
+    const cardResponse = await moovRequest('POST', `/accounts/${moovAccountId}/cards`, {
+      cardNumber,
+      expiration: {
+        month: expMonth,
+        year: expYear.slice(-2)
+      },
+      cardCvv: cvv,
+      holderName,
+      billingAddress: {
+        addressLine1: '123 Main St',
+        city: 'Los Angeles',
+        stateOrProvince: 'CA',
+        postalCode: '90001',
+        country: 'US'
+      }
+    });
+
+    if (cardResponse.status !== 200 && cardResponse.status !== 201) {
+      console.error('Moov card error:', JSON.stringify(cardResponse.data));
+      return res.status(400).json({ error: 'Could not save card. Please check your card details.' });
+    }
+
+    const cardId = cardResponse.data.cardID;
+
+    // Save last4 and brand to wallet for display
+    await pool.query(
+      'UPDATE wallets SET payout_last4 = $1, updated_at = NOW() WHERE email = $2',
+      [last4, email]
+    );
+
+    // Get payment methods to find the push-to-card method
+    await new Promise(resolve => setTimeout(resolve, 1500)); // wait for Moov to process
+    const pmResponse = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
+    const methods = Array.isArray(pmResponse.data) ? pmResponse.data : [];
+    const pushMethod = methods.find(pm =>
+      pm.paymentMethodType === 'push-to-card' ||
+      pm.paymentMethodType === 'card'
+    );
+
+    res.json({
+      success: true,
+      cardId,
+      paymentMethodId: pushMethod ? pushMethod.paymentMethodID : null,
+      last4,
+      brand
+    });
+  } catch (err) {
+    console.error('Moov save card error:', err);
     res.status(400).json({ error: err.message });
   }
 });
