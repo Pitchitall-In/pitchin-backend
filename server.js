@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const app = express();
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const PLATFORM_FEE = 0.02;
-const INSTANT_FEE = 0.015;
+const INSTANT_FEE = 0.025;
 
 app.use(cors({
   origin: ['https://pitchinapp.netlify.app', 'http://localhost:3000'],
@@ -21,7 +21,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Simple password hashing using built-in crypto (no bcrypt needed)
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
@@ -72,7 +71,6 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     )
   `);
-  // Add moov_account_id column if it doesn't exist (for existing tables)
   await pool.query(`ALTER TABLE wallets ADD COLUMN IF NOT EXISTS moov_account_id VARCHAR(255)`).catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
@@ -110,9 +108,9 @@ function emailWelcome(email, name) {
   return sendEmail({
     to: email, subject: 'Welcome to Pitch-In 🎉',
     html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-      <h2 style="color:#2352e8">Welcome to Pitch-In, ${name}! 💰</h2>
+      <h2 style="color:#8a0000">Welcome to Pitch-In, ${name}! 💰</h2>
       <p>Your wallet is ready. Every time a pot you organize fills up, your earnings land here instantly.</p>
-      <p style="color:#666">Withdraw anytime — free standard transfer or instant to your debit card for 1.5%.</p>
+      <p style="color:#666">Withdraw anytime — free standard transfer or instant to your debit card for 2.5%.</p>
       <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
     </div>`
   });
@@ -122,10 +120,10 @@ function emailContributionConfirmed(email, name, amount, potName, potLink) {
   return sendEmail({
     to: email, subject: `✓ You're in! $${amount} added to ${potName}`,
     html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-      <h2 style="color:#2352e8">You're in! 💸</h2>
+      <h2 style="color:#8a0000">You're in! 💸</h2>
       <p>Hey ${name}, your <strong>$${amount}</strong> has been added to <strong>${potName}</strong>.</p>
       <p style="color:#666">Held securely by Stripe. Auto-refunded in full if the goal isn't met.</p>
-      <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
+      <a href="${potLink}" style="display:inline-block;background:#8a0000;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
       <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
     </div>`
   });
@@ -137,7 +135,7 @@ function emailPotFilled(organizerEmail, potName, amount, potLink) {
     html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
       <h2 style="color:#0a8a4a">Your pot is full! 🎉</h2>
       <p><strong>${potName}</strong> has reached its goal. <strong>$${amount}</strong> is now in your Pitch-In wallet.</p>
-      <p style="color:#666">Open the app to withdraw — free standard transfer or instant to your debit card.</p>
+      <p style="color:#666">Open the app to withdraw — free standard transfer or instant to your debit card (2.5% fee).</p>
       <a href="${potLink}" style="display:inline-block;background:#0a8a4a;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View &amp; Withdraw</a>
       <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
     </div>`
@@ -150,7 +148,7 @@ function emailContributorPotFilled(email, name, potName, potLink) {
     html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
       <h2 style="color:#0a8a4a">The pot is full! 🎉</h2>
       <p>Hey ${name}, <strong>${potName}</strong> reached its goal! The organizer has been paid.</p>
-      <a href="${potLink}" style="display:inline-block;background:#2352e8;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
+      <a href="${potLink}" style="display:inline-block;background:#8a0000;color:white;padding:12px 24px;border-radius:50px;text-decoration:none;margin:16px 0">View the Pot</a>
       <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
     </div>`
   });
@@ -173,8 +171,8 @@ function emailWithdrawal(email, name, amount, method, arrivalDate) {
   return sendEmail({
     to: email, subject: `💸 $${amount} withdrawal initiated`,
     html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-      <h2 style="color:#2352e8">Withdrawal confirmed 💸</h2>
-      <p>Hey ${name}, <strong>$${amount}</strong> is on its way to your bank account.</p>
+      <h2 style="color:#8a0000">Withdrawal confirmed 💸</h2>
+      <p>Hey ${name}, <strong>$${amount}</strong> is on its way to your ${method === 'instant' ? 'debit card' : 'bank account'}.</p>
       <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px;margin:16px 0">
         <p style="margin:0;color:#166534">✓ Method: ${method}<br/>✓ Expected: ${arrivalDate}</p>
       </div>
@@ -189,36 +187,27 @@ app.post('/auth/register', async (req, res) => {
     const { email, username, password } = req.body;
     if (!email || !username || !password) return res.status(400).json({ error: 'All fields required' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-
-    // Check if email already exists
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length) return res.status(400).json({ error: 'An account with this email already exists' });
-
     const passwordHash = hashPassword(password);
     const token = generateToken();
-    const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
-
+    const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     await pool.query(
       'INSERT INTO users (email, username, password_hash, token, token_expires) VALUES ($1, $2, $3, $4, $5)',
       [email.toLowerCase(), username, passwordHash, token, tokenExpires]
     );
-
-    // Create wallet for new user
     await pool.query(
       'INSERT INTO wallets (email, display_name) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET display_name = $2',
       [email.toLowerCase(), username]
     );
-
     sendEmail({
-      to: email,
-      subject: 'Welcome to Pitch-In! 🎉',
+      to: email, subject: 'Welcome to Pitch-In! 🎉',
       html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-        <h2 style="color:#2352e8">Welcome, ${username}! 💰</h2>
+        <h2 style="color:#8a0000">Welcome, ${username}! 💰</h2>
         <p>Your Pitch-In account is ready. Create pots, pitch in with your group, and track everything in your wallet.</p>
         <p style="color:#999;font-size:12px">Pitch-In · Pool money with your group</p>
       </div>`
     }).catch(() => {});
-
     res.json({ success: true, token, user: { email: email.toLowerCase(), username } });
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
@@ -228,20 +217,13 @@ app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
     if (!result.rows.length) return res.status(400).json({ error: 'No account found with this email' });
-
     const user = result.rows[0];
-    if (!verifyPassword(password, user.password_hash)) {
-      return res.status(400).json({ error: 'Incorrect password' });
-    }
-
-    // Refresh token
+    if (!verifyPassword(password, user.password_hash)) return res.status(400).json({ error: 'Incorrect password' });
     const token = generateToken();
     const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     await pool.query('UPDATE users SET token=$1, token_expires=$2 WHERE email=$3', [token, tokenExpires, email.toLowerCase()]);
-
     res.json({ success: true, token, user: { email: email.toLowerCase(), username: user.username } });
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
@@ -251,10 +233,7 @@ app.post('/auth/verify', async (req, res) => {
   try {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
-    const result = await pool.query(
-      'SELECT * FROM users WHERE token = $1 AND token_expires > NOW()',
-      [token]
-    );
+    const result = await pool.query('SELECT * FROM users WHERE token = $1 AND token_expires > NOW()', [token]);
     if (!result.rows.length) return res.status(401).json({ error: 'Invalid or expired session' });
     const user = result.rows[0];
     res.json({ success: true, user: { email: user.email, username: user.username } });
@@ -273,36 +252,21 @@ app.get('/og/:slug', async (req, res) => {
     const link = `https://pitchinapp.netlify.app/app.html?pot=${req.params.slug}`;
     const title = `${pot.name} — Pitch In! 💰`;
     const desc = `$${raised.toFixed(0)} raised of $${pot.goal} goal · ${pct}% funded · $${remaining} to go · Tap to pitch in with your group`;
-    // Use static OG image hosted on Netlify — iMessage needs a real PNG/JPEG
     const imageUrl = `https://pitchinapp.netlify.app/og-preview.png`;
     res.setHeader('Cache-Control', 'no-cache, no-store');
-    res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8"/>
-  <title>${title}</title>
-  <meta name="description" content="${desc}"/>
-  <meta property="og:title" content="${title}"/>
-  <meta property="og:description" content="${desc}"/>
-  <meta property="og:url" content="${link}"/>
-  <meta property="og:type" content="website"/>
-  <meta property="og:image" content="${imageUrl}"/>
-  <meta property="og:image:width" content="1200"/>
-  <meta property="og:image:height" content="630"/>
-  <meta property="og:image:type" content="image/png"/>
-  <meta property="og:site_name" content="Pitch-In"/>
-  <meta name="twitter:card" content="summary_large_image"/>
-  <meta name="twitter:title" content="${title}"/>
-  <meta name="twitter:description" content="${desc}"/>
-  <meta name="twitter:image" content="${imageUrl}"/>
-  <meta http-equiv="refresh" content="0;url=${link}"/>
-</head>
-<body>
-  <h1>${title}</h1>
-  <p>${desc}</p>
-  <a href="${link}">Tap to Pitch In →</a>
-</body>
-</html>`);
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>${title}</title>
+      <meta property="og:title" content="${title}"/>
+      <meta property="og:description" content="${desc}"/>
+      <meta property="og:url" content="${link}"/>
+      <meta property="og:type" content="website"/>
+      <meta property="og:image" content="${imageUrl}"/>
+      <meta property="og:image:width" content="1200"/>
+      <meta property="og:image:height" content="630"/>
+      <meta property="og:image:type" content="image/png"/>
+      <meta property="og:site_name" content="Pitch-In"/>
+      <meta name="twitter:card" content="summary_large_image"/>
+      <meta http-equiv="refresh" content="0;url=${link}"/>
+    </head><body><a href="${link}">Tap to Pitch In →</a></body></html>`);
   } catch (err) { res.status(500).send('Error'); }
 });
 
@@ -319,13 +283,10 @@ app.get('/og-image/:slug', async (req, res) => {
       <rect width="1200" height="630" fill="#f7f8fc"/>
       <rect x="60" y="60" width="1080" height="510" rx="24" fill="white" stroke="#e2e6f3" stroke-width="2"/>
       <text x="100" y="160" font-family="Arial" font-size="52" font-weight="bold" fill="#0f1523">${pot.name.substring(0,32)}</text>
-      <text x="100" y="220" font-family="Arial" font-size="28" fill="#6b7499">${pot.desc ? pot.desc.substring(0,60) : 'Group payment pot'}</text>
       <rect x="100" y="280" width="1000" height="20" rx="10" fill="#f0f2f9"/>
-      <rect x="100" y="280" width="${barWidth}" height="20" rx="10" fill="${pct>=100?'#f59e0b':'#2352e8'}"/>
-      <text x="100" y="350" font-family="Arial" font-size="36" font-weight="bold" fill="#2352e8">$${raised.toFixed(0)} raised</text>
+      <rect x="100" y="280" width="${barWidth}" height="20" rx="10" fill="${pct>=100?'#f59e0b':'#8a0000'}"/>
+      <text x="100" y="350" font-family="Arial" font-size="36" font-weight="bold" fill="#8a0000">$${raised.toFixed(0)} raised</text>
       <text x="100" y="395" font-family="Arial" font-size="28" fill="#6b7499">of $${pot.goal} goal · ${pct}% funded</text>
-      <rect x="100" y="440" width="280" height="72" rx="36" fill="#2352e8"/>
-      <text x="240" y="485" font-family="Arial" font-size="28" font-weight="bold" fill="white" text-anchor="middle">Pitch In →</text>
       <text x="1100" y="545" font-family="Arial" font-size="22" fill="#8891b0" text-anchor="end">Pitch-In</text>
     </svg>`);
   } catch (err) { res.status(500).send('Error'); }
@@ -338,10 +299,7 @@ app.post('/wallet/get-or-create', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email required' });
     let result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
     if (!result.rows.length) {
-      await pool.query(
-        'INSERT INTO wallets (email, display_name) VALUES ($1, $2)',
-        [email, displayName || email.split('@')[0]]
-      );
+      await pool.query('INSERT INTO wallets (email, display_name) VALUES ($1, $2)', [email, displayName || email.split('@')[0]]);
       result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
       emailWelcome(email, displayName || email.split('@')[0]).catch(() => {});
     } else if (displayName && !result.rows[0].display_name) {
@@ -349,16 +307,12 @@ app.post('/wallet/get-or-create', async (req, res) => {
       result = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
     }
     const wallet = result.rows[0];
-    // Get recent transactions
-    const txResult = await pool.query(
-      'SELECT * FROM transactions WHERE email = $1 ORDER BY created_at DESC LIMIT 20',
-      [email]
-    );
+    const txResult = await pool.query('SELECT * FROM transactions WHERE email = $1 ORDER BY created_at DESC LIMIT 20', [email]);
     res.json({ wallet, transactions: txResult.rows });
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
-// ── WALLET: Save payout card ───────────────────────────────
+// ── WALLET: Save payout card (kept for backward compat) ───
 app.post('/wallet/save-card', async (req, res) => {
   try {
     const { email, paymentMethodId, last4 } = req.body;
@@ -380,186 +334,9 @@ app.post('/wallet/save-card', async (req, res) => {
 });
 
 // ── WALLET: Withdraw ───────────────────────────────────────
-const MOOV_PUBLIC_KEY = process.env.MOOV_PUBLIC_KEY;
-const MOOV_SECRET_KEY = process.env.MOOV_SECRET_KEY;
-const MOOV_ACCOUNT_ID = process.env.MOOV_ACCOUNT_ID;
-
-// Moov API helper
-async function moovRequest(method, path, body) {
-  const credentials = Buffer.from(`${MOOV_PUBLIC_KEY}:${MOOV_SECRET_KEY}`).toString('base64');
-  const res = await fetch(`https://api.moov.io${path}`, {
-    method,
-    headers: {
-      'Authorization': `Basic ${credentials}`,
-      'Content-Type': 'application/json',
-      'X-Moov-Version': 'v2024.01.00',
-      'X-Wait-For': 'payment-method'
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const text = await res.text();
-  try { return { status: res.status, data: JSON.parse(text) }; }
-  catch { return { status: res.status, data: text }; }
-}
-
-// Create or get Moov account for organizer
-async function getOrCreateMoovAccount(email, displayName) {
-  const result = await pool.query('SELECT moov_account_id FROM wallets WHERE email = $1', [email]);
-  if (result.rows.length && result.rows[0].moov_account_id) {
-    console.log('Existing Moov account:', result.rows[0].moov_account_id);
-    return result.rows[0].moov_account_id;
-  }
-
-  const nameParts = (displayName || email.split('@')[0]).split(' ');
-  const firstName = nameParts[0] || 'User';
-  const lastName = nameParts[1] || 'PitchIn';
-
-  console.log('Creating Moov account for:', email);
-  const response = await moovRequest('POST', '/accounts', {
-    accountType: 'individual',
-    profile: {
-      individual: {
-        name: { firstName, lastName },
-        email
-      }
-    },
-    requestedCapabilities: ['send-funds', 'send-funds.push-to-card', 'collect-funds', 'collect-funds.card-payments', 'wallet'],
-    foreignID: email.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)
-  });
-
-  console.log('Moov create account response:', response.status, JSON.stringify(response.data).substring(0, 200));
-
-  if (response.status === 200 || response.status === 201) {
-    const moovAccountId = response.data.accountID;
-    await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
-
-    // Request capabilities for the new account
-    const capResponse = await moovRequest('POST', `/accounts/${moovAccountId}/capabilities`, {
-      capabilities: ['send-funds', 'send-funds.push-to-card', 'collect-funds', 'collect-funds.card-payments', 'wallet']
-    });
-    console.log('Moov capabilities request:', capResponse.status, JSON.stringify(capResponse.data).substring(0, 200));
-
-    return moovAccountId;
-  }
-
-  // Check if account already exists with this foreignID
-  if (response.status === 409 || (response.data && response.data.error && response.data.error.includes('already'))) {
-    const listResponse = await moovRequest('GET', `/accounts?foreignID=${email.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)}`);
-    if (listResponse.data && listResponse.data.length > 0) {
-      const moovAccountId = listResponse.data[0].accountID;
-      await pool.query('UPDATE wallets SET moov_account_id = $1 WHERE email = $2', [moovAccountId, email]);
-      return moovAccountId;
-    }
-  }
-
-  throw new Error('Could not create Moov account: ' + JSON.stringify(response.data));
-}
-
-// Get Moov token for frontend card entry
-app.post('/moov/token', async (req, res) => {
-  try {
-    const { email, displayName } = req.body;
-    const moovAccountId = await getOrCreateMoovAccount(email, displayName);
-
-    // Create a scoped token for this account so frontend can use moov.js
-    const tokenResponse = await moovRequest('POST', `/accounts/${moovAccountId}/access-token`, {
-      scopes: [
-        `/accounts/${moovAccountId}/cards.write`,
-        `/accounts/${moovAccountId}/payment-methods.read`
-      ]
-    });
-
-    if (tokenResponse.status !== 200 && tokenResponse.status !== 201) {
-      // Fallback — return account ID so frontend can still attempt
-      return res.json({ moovAccountId, token: null });
-    }
-
-    res.json({
-      moovAccountId,
-      token: tokenResponse.data.accessToken,
-      moovPublicKey: MOOV_PUBLIC_KEY
-    });
-  } catch (err) {
-    console.error('Moov token error:', err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post('/moov/save-card', async (req, res) => {
-  try {
-    const { email, cardNumber, expMonth, expYear, cvv, holderName, billingZip, last4, brand } = req.body;
-    const moovAccountId = await getOrCreateMoovAccount(email, holderName || '');
-    console.log('Saving card for Moov account:', moovAccountId);
-
-    const cardResponse = await moovRequest('POST', `/accounts/${moovAccountId}/cards`, {
-      cardNumber,
-      expiration: {
-        month: expMonth.padStart(2,'0'),
-        year: (expYear.length === 2 ? '20' + expYear : expYear).slice(-2)
-      },
-      cardCvv: cvv,
-      holderName,
-      billingAddress: {
-        addressLine1: '123 Main St',
-        city: 'Los Angeles',
-        stateOrProvince: 'CA',
-        postalCode: billingZip || '90001',
-        country: 'US'
-      }
-    });
-
-    console.log('Moov card response:', cardResponse.status, JSON.stringify(cardResponse.data));
-
-    if (cardResponse.status !== 200 && cardResponse.status !== 201) {
-      const errMsg = cardResponse.data?.error || cardResponse.data?.message || JSON.stringify(cardResponse.data);
-      return res.status(400).json({ error: 'Could not save card: ' + errMsg });
-    }
-
-    await pool.query(
-      'UPDATE wallets SET payout_last4 = $1, updated_at = NOW() WHERE email = $2',
-      [last4, email]
-    );
-
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    const pmResponse = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
-    const methods = Array.isArray(pmResponse.data) ? pmResponse.data : [];
-    const pushMethod = methods.find(pm =>
-      pm.paymentMethodType === 'push-to-card' ||
-      pm.paymentMethodType === 'card'
-    );
-
-    res.json({
-      success: true,
-      cardId: cardResponse.data.cardID,
-      paymentMethodId: pushMethod ? pushMethod.paymentMethodID : null,
-      last4,
-      brand
-    });
-  } catch (err) {
-    console.error('Moov save card error:', err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Get Moov payment methods for account
-app.get('/moov/payment-methods/:email', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT moov_account_id FROM wallets WHERE email = $1', [req.params.email]);
-    if (!result.rows.length || !result.rows[0].moov_account_id) {
-      return res.json({ paymentMethods: [] });
-    }
-    const moovAccountId = result.rows[0].moov_account_id;
-    const response = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
-    res.json({ paymentMethods: response.data || [] });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
 app.post('/wallet/withdraw', async (req, res) => {
   try {
-    const { email, amount, method } = req.body;
+    const { email, amount, method, paymentMethodId } = req.body;
     if (!email || !amount) return res.status(400).json({ error: 'Email and amount required' });
 
     const walletResult = await pool.query('SELECT * FROM wallets WHERE email = $1', [email]);
@@ -571,103 +348,99 @@ app.post('/wallet/withdraw', async (req, res) => {
     }
 
     const amountCents = Math.round(parseFloat(amount) * 100);
-    const instantFee = method === 'instant' ? Math.round(amountCents * INSTANT_FEE) : 0;
-    const payoutCents = amountCents - instantFee;
-    const payoutAmount = payoutCents / 100;
-
-    let payoutId, arrivalDate, actualMethod;
+    let payoutId, arrivalDate, actualMethod, feeAmount;
 
     if (method === 'instant') {
-      // Use Moov for instant payout
-      try {
-        const moovAccountId = await getOrCreateMoovAccount(email, wallet.display_name);
-
-        // Get payment methods for this account
-        const pmResponse = await moovRequest('GET', `/accounts/${moovAccountId}/payment-methods`);
-        const paymentMethods = pmResponse.data || [];
-        const rtpMethod = paymentMethods.find(pm => pm.paymentMethodType === 'rtp-credit' || pm.paymentMethodType === 'ach-credit-same-day' || pm.paymentMethodType === 'push-to-card');
-
-        if (!rtpMethod) {
-          return res.status(400).json({
-            error: 'no_payment_method',
-            message: 'No instant payout method on file. Please add a debit card first.',
-            moovAccountId,
-            needsSetup: true
-          });
-        }
-
-        // Get Pitch-In's Moov payment method to send from
-        const platformPMResponse = await moovRequest('GET', `/accounts/${MOOV_ACCOUNT_ID}/payment-methods`);
-        const platformPMs = platformPMResponse.data || [];
-        const platformPM = platformPMs.find(pm => pm.paymentMethodType === 'moov-wallet');
-
-        if (!platformPM) throw new Error('Platform wallet not configured in Moov');
-
-        // Create transfer
-        const transfer = await moovRequest('POST', '/transfers', {
-          source: {
-            accountID: MOOV_ACCOUNT_ID,
-            paymentMethodID: platformPM.paymentMethodID
-          },
-          destination: {
-            accountID: moovAccountId,
-            paymentMethodID: rtpMethod.paymentMethodID
-          },
-          amount: { currency: 'USD', value: payoutCents },
-          description: `Pitch-In wallet withdrawal for ${email}`
-        });
-
-        if (transfer.status !== 200 && transfer.status !== 201) {
-          throw new Error('Transfer failed: ' + JSON.stringify(transfer.data));
-        }
-
-        payoutId = transfer.data.transferID;
-        actualMethod = 'instant';
-        arrivalDate = 'Within 30 minutes';
-      } catch (moovErr) {
-        console.error('Moov instant payout failed:', moovErr.message);
-        // Don't fall back silently — tell the user
-        return res.status(400).json({ error: moovErr.message });
+      // ── INSTANT: Stripe push-to-card ──────────────────────
+      if (!paymentMethodId) {
+        return res.status(400).json({ error: 'Debit card required for instant withdrawal' });
       }
-    } else {
-      // Standard withdrawal via Stripe
+
+      // Calculate fee: 2.5% to organizer, Stripe charges us ~1%
+      const instantFeeCents = Math.round(amountCents * INSTANT_FEE);
+      const payoutCents = amountCents - instantFeeCents;
+      feeAmount = instantFeeCents / 100;
+
+      // Verify it's a debit card capable of receiving push payouts
+      const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+      if (!pm || pm.type !== 'card') {
+        return res.status(400).json({ error: 'Invalid payment method. Must be a debit card.' });
+      }
+
+      // Create a payout to the card using Stripe's payout API
+      // We send from our Stripe balance to the card token
       const payout = await stripe.payouts.create({
         amount: payoutCents,
+        currency: 'usd',
+        method: 'instant',
+        destination: paymentMethodId,
+        metadata: { email, walletWithdrawal: 'true', type: 'instant_card' }
+      });
+
+      payoutId = payout.id;
+      actualMethod = 'instant';
+      arrivalDate = 'Within 30 minutes';
+
+      // Deduct full amount (including fee) from wallet
+      await pool.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE email = $2', [amount, email]);
+      await pool.query(
+        'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
+        [email, 'withdrawal', payoutCents / 100, feeAmount, 'Instant withdrawal to debit card', payoutId]
+      );
+
+      const displayName = wallet.display_name || email.split('@')[0];
+      emailWithdrawal(email, displayName, (payoutCents / 100).toFixed(2), 'Instant (debit card)', arrivalDate).catch(() => {});
+
+      return res.json({
+        success: true,
+        amount: payoutCents / 100,
+        fee: feeAmount,
+        method: 'instant',
+        arrivalDate,
+        newBalance: parseFloat(wallet.balance) - parseFloat(amount)
+      });
+
+    } else {
+      // ── STANDARD: Stripe payout to bank ───────────────────
+      const payout = await stripe.payouts.create({
+        amount: amountCents,
         currency: 'usd',
         method: 'standard',
         metadata: { email, walletWithdrawal: 'true' }
       });
       payoutId = payout.id;
       actualMethod = 'standard';
+      feeAmount = 0;
       arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', {
         weekday: 'long', month: 'long', day: 'numeric'
       });
+
+      await pool.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE email = $2', [amount, email]);
+      await pool.query(
+        'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
+        [email, 'withdrawal', amount, 0, 'Standard withdrawal', payoutId]
+      );
+
+      const displayName = wallet.display_name || email.split('@')[0];
+      emailWithdrawal(email, displayName, parseFloat(amount).toFixed(2), 'Standard (next business day)', arrivalDate).catch(() => {});
+
+      return res.json({
+        success: true,
+        amount: parseFloat(amount),
+        fee: 0,
+        method: 'standard',
+        arrivalDate,
+        newBalance: parseFloat(wallet.balance) - parseFloat(amount)
+      });
     }
-
-    // Deduct from wallet
-    await pool.query(
-      'UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE email = $2',
-      [amount, email]
-    );
-
-    // Record transaction
-    await pool.query(
-      'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [email, 'withdrawal', amount, instantFee / 100, `${actualMethod === 'instant' ? 'Instant' : 'Standard'} withdrawal`, payoutId]
-    );
-
-    const displayName = wallet.display_name || email.split('@')[0];
-    emailWithdrawal(email, displayName, payoutAmount.toFixed(2), actualMethod === 'instant' ? 'Instant (30 min)' : 'Standard (next business day)', arrivalDate).catch(() => {});
-
-    res.json({
-      success: true,
-      amount: payoutAmount,
-      fee: instantFee / 100,
-      method: actualMethod,
-      arrivalDate,
-      newBalance: parseFloat(wallet.balance) - parseFloat(amount)
-    });
-  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
+  } catch (err) {
+    console.error('Withdraw error:', err);
+    // Give a clean error message for common Stripe errors
+    let msg = err.message || 'Withdrawal failed';
+    if (err.code === 'insufficient_funds') msg = 'Insufficient Stripe balance. Contact support.';
+    if (err.code === 'invalid_card_type') msg = 'This card cannot receive instant payouts. Please use a Visa or Mastercard debit card.';
+    res.status(400).json({ error: msg });
+  }
 });
 
 // ── POT: Save ──────────────────────────────────────────────
@@ -716,7 +489,6 @@ app.post('/confirm-contribution', async (req, res) => {
     if (!potResult.rows.length) return res.status(404).json({ error: 'Pot not found' });
     const pot = potResult.rows[0].data;
 
-    // Update member
     const existing = pot.members.find(m => m.name === memberName);
     if (existing) {
       existing.contributed = parseFloat(((existing.contributed || 0) + parseFloat(amount)).toFixed(2));
@@ -726,7 +498,6 @@ app.post('/confirm-contribution', async (req, res) => {
       pot.members.push({ name: memberName, contributed: parseFloat(amount), paymentIntentId, email: email || null });
     }
 
-    // Track contributor wallet
     if (email) {
       await pool.query(
         'INSERT INTO wallets (email, display_name, total_contributed) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET total_contributed = wallets.total_contributed + $3, updated_at = NOW()',
@@ -746,7 +517,6 @@ app.post('/confirm-contribution', async (req, res) => {
     const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
     if (email) emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
 
-    // Check if pot is full
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const isFull = raised >= pot.goal;
 
@@ -757,7 +527,6 @@ app.post('/confirm-contribution', async (req, res) => {
       const feeCents = Math.round(raised * 100 * PLATFORM_FEE);
       const organizerAmount = parseFloat(((raised * 100 - feeCents) / 100).toFixed(2));
 
-      // Credit organizer wallet instantly
       if (pot.organizerEmail) {
         await pool.query(
           `INSERT INTO wallets (email, display_name, balance, total_earned)
@@ -776,7 +545,6 @@ app.post('/confirm-contribution', async (req, res) => {
         emailPotFilled(pot.organizerEmail, pot.name, organizerAmount.toFixed(2), potLink).catch(() => {});
       }
 
-      // Notify all contributors
       pot.members.forEach(m => {
         if (m.email && m.email !== pot.organizerEmail) {
           emailContributorPotFilled(m.email, m.name, pot.name, potLink).catch(() => {});
@@ -843,7 +611,7 @@ app.post('/refund-expired-pot', async (req, res) => {
   } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
-// Get payment intent details (used after Cash App Pay redirect)
+// ── Get payment intent details ─────────────────────────────
 app.get('/get-payment-intent/:id', async (req, res) => {
   try {
     const paymentIntent = await stripe.paymentIntents.retrieve(req.params.id);
@@ -853,20 +621,7 @@ app.get('/get-payment-intent/:id', async (req, res) => {
       potId: paymentIntent.metadata.potId,
       potName: paymentIntent.metadata.potName
     });
-  } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Temporary fix: clear bad Moov account IDs
-app.post('/admin/clear-moov-ids', async (req, res) => {
-  try {
-    const result = await pool.query('UPDATE wallets SET moov_account_id = NULL');
-    res.json({ success: true, cleared: result.rowCount });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { console.error(err); res.status(400).json({ error: err.message }); }
 });
 
 app.get('/', (req, res) => res.send('Pitch-In backend running'));
