@@ -401,28 +401,37 @@ app.post('/wallet/withdraw', async (req, res) => {
       });
 
     } else {
-      // ── STANDARD: Stripe payout to bank ───────────────────
+      // ── STANDARD: Stripe push-to-card, no fee, 1-2 business days ──
+      if (!paymentMethodId) {
+        return res.status(400).json({ error: 'Debit card required for withdrawal' });
+      }
+
+      const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+      if (!pm || pm.type !== 'card') {
+        return res.status(400).json({ error: 'Invalid payment method. Must be a debit card.' });
+      }
+
+      // Standard payout to their debit card — no fee, 1-2 business days
       const payout = await stripe.payouts.create({
         amount: amountCents,
         currency: 'usd',
         method: 'standard',
-        metadata: { email, walletWithdrawal: 'true' }
+        destination: paymentMethodId,
+        metadata: { email, walletWithdrawal: 'true', type: 'standard_card' }
       });
+
       payoutId = payout.id;
-      actualMethod = 'standard';
       feeAmount = 0;
-      arrivalDate = new Date(payout.arrival_date * 1000).toLocaleDateString('en-US', {
-        weekday: 'long', month: 'long', day: 'numeric'
-      });
+      arrivalDate = '1-2 business days';
 
       await pool.query('UPDATE wallets SET balance = balance - $1, updated_at = NOW() WHERE email = $2', [amount, email]);
       await pool.query(
         'INSERT INTO transactions (email, type, amount, fee, description, stripe_id) VALUES ($1, $2, $3, $4, $5, $6)',
-        [email, 'withdrawal', amount, 0, 'Standard withdrawal', payoutId]
+        [email, 'withdrawal', amount, 0, 'Standard withdrawal to debit card', payoutId]
       );
 
       const displayName = wallet.display_name || email.split('@')[0];
-      emailWithdrawal(email, displayName, parseFloat(amount).toFixed(2), 'Standard (next business day)', arrivalDate).catch(() => {});
+      emailWithdrawal(email, displayName, parseFloat(amount).toFixed(2), 'Standard (1-2 business days)', arrivalDate).catch(() => {});
 
       return res.json({
         success: true,
