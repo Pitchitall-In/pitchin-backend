@@ -167,6 +167,20 @@ function emailRefund(email, name, amount, potName) {
   });
 }
 
+function emailFollowUp(email, name, potName) {
+  // Send 24hrs after contributing without an account
+  return sendEmail({
+    to: email, subject: `Start your own pot on Pitch-In 💰`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+      <h2 style="color:#8a0000">Hey ${name}, you just pitched in! 🎉</h2>
+      <p>You contributed to <strong>${potName}</strong> — now imagine being the one who organizes the next one.</p>
+      <p style="color:#666">With Pitch-In you can collect money from any group in minutes. No chasing people down, no Venmo requests going ignored. Cards only get charged when the full goal is met.</p>
+      <a href="https://pitchinapp.netlify.app" style="display:inline-block;background:#8a0000;color:white;padding:12px 28px;border-radius:50px;text-decoration:none;margin:16px 0;font-weight:700">Create Your Own Pot →</a>
+      <p style="color:#999;font-size:12px;margin-top:24px">Pitch-In · Pool money with your group<br/>Questions? <a href="mailto:support@pitchin.llc" style="color:#999">support@pitchin.llc</a></p>
+    </div>`
+  });
+}
+
 function emailWithdrawal(email, name, amount, method, arrivalDate) {
   return sendEmail({
     to: email, subject: `💸 $${amount} withdrawal initiated`,
@@ -524,7 +538,13 @@ app.post('/confirm-contribution', async (req, res) => {
     );
 
     const potLink = `https://pitchinapp.netlify.app/app.html?pot=${slug}`;
-    if (email) emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
+    if (email) {
+      emailContributionConfirmed(email, memberName, amount, pot.name, potLink).catch(() => {});
+      // Schedule follow-up email 24 hours later for non-account contributors
+      setTimeout(function() {
+        emailFollowUp(email, memberName, pot.name).catch(() => {});
+      }, 24 * 60 * 60 * 1000);
+    }
 
     const raised = pot.members.reduce((s, m) => s + (m.contributed || 0), 0);
     const isFull = raised >= pot.goal;
