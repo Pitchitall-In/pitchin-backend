@@ -388,7 +388,8 @@ app.post('/wallet/withdraw', async (req, res) => {
         currency: 'usd',
         method: 'instant',
         destination: paymentMethodId,
-        metadata: { email, walletWithdrawal: 'true', type: 'instant_card' }
+        description: `Instant wallet withdrawal for organizer: ${email}`,
+        metadata: { email, walletWithdrawal: 'true', type: 'instant_card', platform: 'Pitch-In' }
       });
 
       payoutId = payout.id;
@@ -431,7 +432,8 @@ app.post('/wallet/withdraw', async (req, res) => {
         currency: 'usd',
         method: 'standard',
         destination: paymentMethodId,
-        metadata: { email, walletWithdrawal: 'true', type: 'standard_card' }
+        description: `Standard wallet withdrawal for organizer: ${email}`,
+        metadata: { email, walletWithdrawal: 'true', type: 'standard_card', platform: 'Pitch-In' }
       });
 
       payoutId = payout.id;
@@ -496,7 +498,9 @@ app.post('/create-payment-intent', async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100),
       currency: 'usd',
-      metadata: { potId, potName },
+      description: `Contribution to pot: ${potName}`,
+      statement_descriptor_suffix: 'PITCH-IN',
+      metadata: { potId, potName, platform: 'Pitch-In', type: 'pot_contribution' },
       automatic_payment_methods: { enabled: true },
     });
     res.json({ clientSecret: paymentIntent.client_secret, useAuthCapture: false });
@@ -619,7 +623,11 @@ app.post('/refund-expired-pot', async (req, res) => {
     for (const member of pot.members) {
       if (member.paymentIntentId && member.contributed > 0) {
         try {
-          const refund = await stripe.refunds.create({ payment_intent: member.paymentIntentId });
+          const refund = await stripe.refunds.create({ 
+            payment_intent: member.paymentIntentId,
+            reason: 'requested_by_customer',
+            metadata: { potName: pot.name, potSlug: slug, reason: 'Pot expired - goal not met', platform: 'Pitch-In' }
+          });
           member.refunded = true;
           member.refundId = refund.id;
           results.push({ name: member.name, status: 'refunded', amount: member.contributed });
